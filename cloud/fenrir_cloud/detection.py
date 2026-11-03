@@ -608,6 +608,8 @@ def _ticket_for(db: Session, device: Device, incident: Incident, alert: Alert) -
         priority=services.PRIORITY_BY_SEVERITY.get(alert.severity, "P3"), source="incident", incident_id=incident.id,
         device_id=device.id, queue="Security Operations",
     )
+    if ticket is None:
+        return
     db.flush()
     incident.ticket_id = ticket.id
 

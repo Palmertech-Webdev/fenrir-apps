@@ -15,6 +15,7 @@ import { RunScript } from "./rmm/Scripts";
 import { SystemTab } from "./DeviceSystem";
 import { DeviceVulns } from "./DeviceVulns";
 import { DeviceDetails, DeviceOverview, useCommandLabels } from "./DeviceOverview";
+import { AppInfo, Feature, hasAny, useAppInfo } from "../appinfo";
 
 // The map (Leaflet) is only downloaded when a phone's Location tab is opened.
 const LocationTab = lazy(() => import("./DeviceLocation"));
@@ -45,6 +46,17 @@ const PROFILE_SECTIONS: { key: string; label: string; subs?: string[] }[] = [
   { key: "security", label: "Security", subs: ["Alerts"] },
   { key: "settings", label: "Settings", subs: ["Effective policy", "Device details"] },
 ];
+// Sections and sub-pages that belong to one app; the rest are part of every app with devices.
+const PART_FEATURES: Record<string, Feature[]> = {
+  health: ["rmm"], Alerts: ["av"], "Microsoft Defender": ["av"], Vulnerabilities: ["vuln"], "Local admin": ["rmm"],
+  Patches: ["rmm"], "Scripts & jobs": ["rmm"], Compliance: ["mobile"], "App protection": ["mobile"],
+};
+function forApp(info: AppInfo, sections: { key: string; label: string; subs?: string[] }[]) {
+  return sections
+    .filter((s) => hasAny(info, PART_FEATURES[s.key]))
+    .map((s) => (s.subs ? { ...s, subs: s.subs.filter((x) => hasAny(info, PART_FEATURES[x])) } : s))
+    .filter((s) => !s.subs || s.subs.length > 0);
+}
 const OPEN_ALERT = (a: any) => !["resolved", "closed", "false_positive"].includes(a.status);
 const PLATFORM_GLYPH: Record<string, string> = { windows: "⊞", macos: "⌘", linux: "🐧", android: "📱", ios: "📱" };
 
@@ -87,13 +99,15 @@ const levelTone = (v: number | undefined, warn: number, bad: number, invert = fa
 export default function DeviceDetail() {
   const { id } = useParams();
   const { tenantName, can } = useApp();
+  const info = useAppInfo();
+  const rmm = hasAny(info, ["rmm"]);
   const { data, error, reload } = useData<any>(`devices/${id}`);
   const { data: policies } = useListData<any>("policies", { tenant_id: data?.device.tenantId }, [data?.device.tenantId]);
   const { data: groups } = useListData<any>("groups", { tenant_id: data?.device.tenantId }, [data?.device.tenantId]);
   const { data: profile } = useData<any>(id ? `devices/${id}/profile` : null);
   const isPhone = data?.device.platform === "android";
   const agentless = Boolean(data?.device.agentless);
-  const { data: patches } = useData<any>(id && data && !isPhone && !agentless ? `rmm/devices/${id}/patches` : null, {}, [isPhone, agentless]);
+  const { data: patches } = useData<any>(id && data && rmm && !isPhone && !agentless ? `rmm/devices/${id}/patches` : null, {}, [isPhone, agentless, rmm]);
   const { data: whereabouts, reload: reloadWhere } = useData<any>(id && isPhone ? `devices/${id}/locations` : null, { hours: 24 }, [isPhone]);
   const [reinstating, setReinstating] = useState(false);
   const [installerReady, setInstallerReady] = useState(false);
@@ -120,7 +134,7 @@ export default function DeviceDetail() {
   if (!data) return <div className="empty">Loading…</div>;
   const d = data.device;
   const isWindows = String(d.platform || "windows").toLowerCase() === "windows";
-  const sections = agentless ? PROFILE_SECTIONS : isPhone ? PHONE_SECTIONS : SECTIONS.map((s) => s.key === "security" && !isWindows ? { ...s, subs: s.subs!.filter((x) => x !== "Local admin" && x !== "Microsoft Defender") } : s);
+  const sections = forApp(info, agentless ? PROFILE_SECTIONS : isPhone ? PHONE_SECTIONS : SECTIONS.map((s) => s.key === "security" && !isWindows ? { ...s, subs: s.subs!.filter((x) => x !== "Local admin" && x !== "Microsoft Defender") } : s));
   const section = sections.find((s) => s.key === params.get("tab")) ?? sections[0];
   const sub = section.subs ? (section.subs.find((s) => s === params.get("sub")) ?? section.subs[0]) : undefined;
   const go = (tab: string, subPage?: string) => {

@@ -4,6 +4,8 @@
 x-fenrir-environment: &fenrir-environment
   # production refuses to start on unsafe settings (placeholder secrets, SQLite); see cloud/fenrir_cloud/production.py.
   FENRIR_ENV: ${FENRIR_ENV:-production}
+  # Which app this server runs: complete, rmm, av, vuln, crm, psa, grc, m365, mobile or docs (see apps/README.md).
+  FENRIR_APP: ${FENRIR_APP:-complete}
   FENRIR_DATABASE_URL: postgresql+psycopg://fenrir:${POSTGRES_PASSWORD}@db:5432/fenrir
   FENRIR_SECRET_KEY: ${FENRIR_SECRET_KEY:?set FENRIR_SECRET_KEY}
   FENRIR_PUBLIC_URL: ${FENRIR_PUBLIC_URL:?set FENRIR_PUBLIC_URL}
@@ -41,6 +43,8 @@ x-fenrir-environment: &fenrir-environment
   FENRIR_M365_CLIENT_SECRET: ${FENRIR_M365_CLIENT_SECRET:-}
   FENRIR_M365_LOG_RETENTION_DAYS: ${FENRIR_M365_LOG_RETENTION_DAYS:-730}
   FENRIR_M365_SYNC_HOURS: ${FENRIR_M365_SYNC_HOURS:-6}
+  FENRIR_VULN_INTEL: ${FENRIR_VULN_INTEL:-true}
+  FENRIR_HIBP_API_KEY: ${FENRIR_HIBP_API_KEY:-}
 
 services:
   db:

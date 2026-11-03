@@ -251,6 +251,8 @@ def support_request(body: dict = Body(default={}), device: Device = Depends(curr
     ) if part)
     ticket = services.open_ticket(db, device.tenant_id, summary, description=description, priority="P3", source="agent",
                                   requester=user or device.hostname, device_id=device.id)
+    if ticket is None:
+        raise HTTPException(409, "Support requests need the PSA, which this server does not run")
     audit.record(db, f"device:{device.hostname}", "ticket.requested_from_agent", str(ticket.number), device.tenant_id,
                  ticket=ticket.id)
     db.commit()

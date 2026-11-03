@@ -253,9 +253,15 @@ def open_ticket(
     queue: str = "Service Desk",
     board_id: str | None = None,
     **fields,
-) -> Ticket:
-    """Open a ticket on a service board, apply its SLA, auto-assign, and run "ticket created" workflow rules."""
-    from . import psa
+) -> Ticket | None:
+    """Open a ticket on a service board, apply its SLA, auto-assign, and run "ticket created" workflow rules.
+
+    Tickets belong to the PSA. Where the running app has no PSA (apps.py), nothing is opened and this returns None:
+    callers skip their hand-off rather than file work nobody can see."""
+    from . import apps, psa
+
+    if not apps.enabled("psa"):
+        return None
 
     owner = msp_tenant_id(db, account_tenant_id)
     board = None

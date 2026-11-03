@@ -541,6 +541,8 @@ def incident_ticket(incident_id: str, principal: Principal = Depends(current_pri
     ticket = services.open_ticket(db, incident.tenant_id, f"[Security] {incident.title}", f"Opened from incident {incident.id}",
                                   services.PRIORITY_BY_SEVERITY.get(incident.severity, "P3"), "incident", principal.actor,
                                   incident.id, incident.device_id, "Security Operations")
+    if ticket is None:
+        raise HTTPException(409, "Tickets are part of the PSA, which this server does not run")
     db.flush()
     incident.ticket_id = ticket.id
     db.commit()

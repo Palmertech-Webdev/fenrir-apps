@@ -3,6 +3,7 @@ import { Fragment } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ago, fmtTime } from "../api";
 import { useApp } from "../app-context";
+import { useFeature } from "../appinfo";
 import { Bars, ErrorNote, Meter, PageHead, Pill, Sev, Stat, Table, useData } from "../components/ui";
 import { PRIORITY_TONE } from "./psa/ServiceBoard";
 
@@ -56,13 +57,16 @@ function MyWork() {
 export default function Overview() {
   const { tenantId, tenantName } = useApp();
   const navigate = useNavigate();
+  // Tickets and vulnerabilities belong to other apps: shown only when this server runs them too.
+  const psa = useFeature("psa");
+  const vuln = useFeature("vuln");
   const { data, error } = useData<any>("dashboard", { tenant_id: tenantId, days: 14 });
   const sev = data?.alerts.bySeverity ?? {};
   const days: { label: string; value: number }[] = (data?.alerts.perDay ?? []).map((d: any) => ({ label: d.day, value: d.count }));
   return (
     <>
       <PageHead title="Dashboard" subtitle={`${tenantId ? tenantName(tenantId) : "All tenants"}`} />
-      <MyWork />
+      {psa && <MyWork />}
       <h2 style={{ margin: "24px 0 10px" }}>Security <span className="small muted">last 14 days</span></h2>
       <ErrorNote error={error} />
       {data && (
@@ -72,8 +76,9 @@ export default function Overview() {
             <Stat label="Open incidents" value={data.incidents.length} accent={data.incidents.length ? "red" : "green"}
                   hint={`${sev.critical ?? 0} critical · ${sev.high ?? 0} high alerts`} />
             <Stat label="Threats stopped" value={data.protection.threatEvents} accent="green" hint={`${data.protection.dnsBlocked} malicious DNS lookups blocked`} />
-            <Stat label="Known-exploited vulns" value={data.vulnerabilities.knownExploited} accent={data.vulnerabilities.knownExploited ? "amber" : "green"}
+            {vuln ? <Stat label="Known-exploited vulns" value={data.vulnerabilities.knownExploited} accent={data.vulnerabilities.knownExploited ? "amber" : "green"}
                   hint={`${data.vulnerabilities.bySeverity.critical ?? 0} critical open`} />
+              : <Stat label="Isolated now" value={data.devices.isolated} accent={data.devices.isolated ? "amber" : "green"} hint="cut off from the network" />}
           </div>
           <div className="grid side" style={{ marginTop: 16 }}>
             <div className="card">
@@ -89,7 +94,7 @@ export default function Overview() {
                 <dt>Isolated now</dt><dd>{displayValue(data.devices.isolated)}</dd>
                 <dt>At risk (score ≥ 40)</dt><dd>{displayValue(data.devices.atRisk)}</dd>
                 {Object.entries(data.devices.byPlatform).map(([k, v]) => (<Fragment key={k}><dt>{k}</dt><dd>{String(v)}</dd></Fragment>))}
-                <dt>Open tickets</dt><dd>{displayValue(data.psa.openTickets)} {data.psa.slaBreached ? <span className="badge tone-bad">{displayValue(data.psa.slaBreached)} past SLA</span> : null}</dd>
+                {psa && <><dt>Open tickets</dt><dd>{displayValue(data.psa.openTickets)} {data.psa.slaBreached ? <span className="badge tone-bad">{displayValue(data.psa.slaBreached)} past SLA</span> : null}</dd></>}
               </dl>
             </div>
           </div>

@@ -173,7 +173,7 @@ def sync_tenant(db: Session, tenant: Tenant, client: httpx.Client | None = None,
                             f"{email} appears in the {row.breach_title} breach ({row.breach_date}), which exposed "
                             f"{', '.join(row.data_classes) or 'account data'}. Reset the password, revoke sessions and enforce MFA.",
                             priority="P2", source="dark-web", queue="Security Operations")
-                        row.ticket_id = ticket.id
+                        row.ticket_id = ticket.id if ticket else None
                     found += 1
         db.flush()
         _refresh_device_flags(db, tenant.id)

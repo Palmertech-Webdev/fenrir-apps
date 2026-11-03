@@ -21,6 +21,10 @@ from ..serialize import apply_fields, to_dict
 
 router = APIRouter(prefix="/api/console", tags=["PSA"])
 inbound = APIRouter(prefix="/api/inbound", tags=["PSA"])
+# The knowledge base is shared by the PSA and the Docs & Vault app, so it has its own router.
+kb_router = APIRouter(prefix="/api/console", tags=["Knowledge base"])
+# Products and quotes are shared by the CRM and the PSA.
+sales_router = APIRouter(prefix="/api/console", tags=["Products and quotes"])
 
 
 def _msp(principal: Principal, db: Session) -> str:
@@ -642,10 +646,11 @@ def _validate_configuration_links(db: Session, account_tenant_id: str | None, va
                 raise HTTPException(409, "The device is already linked to another configuration")
 
 
-def _crud(model, prefix: str, fields: set[str], required: str, permission: str = "crm"):
+def _crud(model, prefix: str, fields: set[str], required: str, permission: str = "crm", on: APIRouter | None = None):
     """Register list/create/update/delete routes for a simple tenant-owned PSA collection."""
+    target = on or router
 
-    @router.get(f"/psa/{prefix}", name=f"list_{prefix}")
+    @target.get(f"/psa/{prefix}", name=f"list_{prefix}")
     def _list(account_tenant_id: str | None = Query(default=None, alias="accountTenantId"),
               tenant_id: str | None = None,
               principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
@@ -660,7 +665,7 @@ def _crud(model, prefix: str, fields: set[str], required: str, permission: str =
         return [{**to_dict(r), "account": names.get(getattr(r, "account_tenant_id", None), "")}
                 for r in db.execute(query.limit(5000)).scalars()]
 
-    @router.post(f"/psa/{prefix}", name=f"create_{prefix}")
+    @target.post(f"/psa/{prefix}", name=f"create_{prefix}")
     def _create(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
         principal.require(permission)
         owner = body.get("tenantId") if model is KbArticle else None
@@ -691,7 +696,7 @@ def _crud(model, prefix: str, fields: set[str], required: str, permission: str =
         db.commit()
         return to_dict(obj)
 
-    @router.patch(f"/psa/{prefix}/{{obj_id}}", name=f"update_{prefix}")
+    @target.patch(f"/psa/{prefix}/{{obj_id}}", name=f"update_{prefix}")
     def _update(obj_id: str, body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
         principal.require(permission)
         obj = _owned(db, principal, model, obj_id)
@@ -713,7 +718,7 @@ def _crud(model, prefix: str, fields: set[str], required: str, permission: str =
         db.commit()
         return to_dict(obj)
 
-    @router.delete(f"/psa/{prefix}/{{obj_id}}", name=f"delete_{prefix}")
+    @target.delete(f"/psa/{prefix}/{{obj_id}}", name=f"delete_{prefix}")
     def _delete(obj_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
         principal.require(permission)
         obj = _owned(db, principal, model, obj_id)
@@ -728,8 +733,8 @@ _crud(Configuration, "configurations", {"name", "type", "status", "device_id", "
                                         "serial_number", "ip_address", "mac_address", "os", "purchase_date", "warranty_expires",
                                         "vendor", "notes", "questions"}, "name")
 _crud(Product, "products", {"sku", "description", "category", "cost", "price", "recurring", "taxable", "vendor", "active"}, "sku",
-      permission="billing")
-_crud(KbArticle, "kb", {"title", "body", "category", "tags", "public"}, "title")
+      permission="billing", on=sales_router)
+_crud(KbArticle, "kb", {"title", "body", "category", "tags", "public"}, "title", on=kb_router)
 
 
 @router.post("/psa/configurations/sync")
@@ -755,7 +760,7 @@ def sync_configurations(body: dict = Body(default={}), principal: Principal = De
 # --------------------------------------------------------------------------- quotes
 
 
-@router.get("/psa/quotes")
+@sales_router.get("/psa/quotes")
 def list_quotes(principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     names = dict(db.execute(select(Tenant.id, Tenant.name)).all())
     rows = db.execute(select(Quote).where(Quote.tenant_id.in_(principal.tenant_ids)).order_by(Quote.created_at.desc())).scalars()
@@ -768,7 +773,7 @@ def _quote_totals(quote: Quote) -> dict:
     return {"oneOffTotal": round(one_off, 2), "monthlyTotal": round(monthly, 2)}
 
 
-@router.post("/psa/quotes")
+@sales_router.post("/psa/quotes")
 def create_quote(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("crm")
     # A quote for one of the caller's customers is fine; an unattached quote is MSP-level.
@@ -793,7 +798,7 @@ def create_quote(body: dict = Body(...), principal: Principal = Depends(current_
     return {**to_dict(quote), **_quote_totals(quote)}
 
 
-@router.patch("/psa/quotes/{quote_id}")
+@sales_router.patch("/psa/quotes/{quote_id}")
 def update_quote(quote_id: str, body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("crm")
     quote = _owned(db, principal, Quote, quote_id)
@@ -804,7 +809,7 @@ def update_quote(quote_id: str, body: dict = Body(...), principal: Principal = D
     return {**to_dict(quote), **_quote_totals(quote)}
 
 
-@router.delete("/psa/quotes/{quote_id}")
+@sales_router.delete("/psa/quotes/{quote_id}")
 def delete_quote(quote_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("crm")
     quote = _owned(db, principal, Quote, quote_id)
@@ -816,7 +821,7 @@ def delete_quote(quote_id: str, principal: Principal = Depends(current_principal
     return {"ok": True}
 
 
-@router.get("/psa/quotes/{quote_id}/print", response_class=HTMLResponse)
+@sales_router.get("/psa/quotes/{quote_id}/print", response_class=HTMLResponse)
 def print_quote(quote_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     quote = _owned(db, principal, Quote, quote_id)
     account = db.get(Tenant, quote.account_tenant_id) if quote.account_tenant_id else None

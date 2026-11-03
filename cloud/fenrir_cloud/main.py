@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from sqlalchemy import delete, func, select, text
@@ -240,7 +240,9 @@ def _maintenance_jobs(settings: Settings) -> list[tuple[str, object]]:
         from . import blocklists
 
         jobs.append(("dns.blocklists", lambda db: [log.info("dns blocklist sync: %s", r) for r in blocklists.sync_due(db)]))
-    return jobs
+    from . import apps as fenrir_apps
+
+    return [job for job in jobs if fenrir_apps.job_enabled(job[0])]
 
 
 def _maintenance_loop(settings: Settings, stop: threading.Event) -> None:
@@ -303,7 +305,9 @@ def _scheduled_jobs() -> list[tuple[str, int, object]]:
     from .routers import artifacts as artifact_store
     from .routers import backup as backup_health
 
-    return [
+    from . import apps as fenrir_apps
+
+    jobs = [
         ("rmm", 1, rmm.tick),
         ("psa.timed-workflows", 1, psa.timed_workflows),
         ("remote.expire-sessions", 1, remote.expire_sessions),
@@ -322,6 +326,7 @@ def _scheduled_jobs() -> list[tuple[str, int, object]]:
         ("audit.checkpoint", 120, audit.daily_checkpoint),  # CORE-06: daily chain-head checkpoint (published to webhooks)
         ("audit.retention", 120, audit.apply_retention),
     ]
+    return [job for job in jobs if fenrir_apps.job_enabled(job[0])]
 
 
 def _scheduler_loop(stop: threading.Event, interval: float = 30.0) -> None:
@@ -499,45 +504,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return exc.response()
 
     remote.install_wake_hook()
-    for module in (agent_api, admin, fleet, soc, crm_router, business, rmm_router, service_mgmt, psa_router, remote_router, portal):
-        app.include_router(module.router)
-    app.include_router(onboarding_router.workspace_router)
-    for module in (m365_admin_router, m365_router, network_router, grc_router, backup_router, soc_workflows, ad_router, agent_health_router, onboarding_router, m365_exchange_router, m365_signin_router, m365_intune_router, m365_reports_router, m365_collaboration_router, grc_programme_router,
-                   rollouts_router, apikeys_router, roles_router, approvals_router, exclusions_router,
-                   exposure_intel_router, m365_partner_router, m365_workspace_router, m365_lifecycle_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router):
-        app.include_router(module.router)
-    app.include_router(documentation_router.router)
-    app.include_router(m365_router.oauth)
-    app.include_router(psa_router.inbound)
-    app.include_router(business.xero_callback)
-    app.include_router(backup_router.ingest)
+    # Only the running app's routes are served (apps.py, FENRIR_APP); the core is part of every app.
+    from . import apps as fenrir_apps
+
+    def mount(module, attr: str = "router") -> None:
+        if fenrir_apps.router_enabled(module.__name__.rsplit(".", 1)[-1]):
+            app.include_router(getattr(module, attr))
+
+    app.include_router(business.webhooks)  # every app
+    if fenrir_apps.any_enabled("psa", "docs"):
+        app.include_router(psa_router.kb_router)
+    if fenrir_apps.any_enabled("crm", "psa"):
+        app.include_router(psa_router.sales_router)
+    for module in (agent_api, admin, fleet, soc, crm_router, business, rmm_router, service_mgmt, psa_router, remote_router, portal,
+                   m365_admin_router, m365_router, network_router, grc_router, backup_router, soc_workflows, ad_router, agent_health_router,
+                   onboarding_router, m365_exchange_router, m365_signin_router, m365_intune_router, m365_reports_router,
+                   m365_collaboration_router, grc_programme_router, rollouts_router, apikeys_router, roles_router, approvals_router,
+                   exclusions_router, exposure_intel_router, m365_partner_router, m365_workspace_router, m365_lifecycle_router,
+                   condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router,
+                   documentation_router, customization_router):
+        mount(module)
+    mount(onboarding_router, "workspace_router")
+    mount(m365_router, "oauth")
+    mount(psa_router, "inbound")
+    mount(business, "xero_callback")
+    mount(grc_assurance_router)
+    mount(grc_assurance_router, "public")
+    if fenrir_apps.any_enabled("av", "vuln"):
+        # One module serves both apps: vulnerabilities and attack surface are the Vulnerability Manager's; DNS
+        # filtering, threat intel and the malware model are the Antivirus app's; the compliance summary is both.
+        from fastapi import APIRouter
+
+        def owner(path: str) -> str | None:
+            if path.startswith(("/api/console/vulnerabilities", "/api/console/exposure/")):
+                return "vuln"
+            if path.startswith(("/api/console/dns/", "/api/console/intel/", "/api/console/ml/", "/dns/")):
+                return "av"
+            return None
+
+        for source in (protection.router, protection.console):
+            part = APIRouter()
+            part.routes.extend(r for r in source.routes if owner(r.path) is None or fenrir_apps.enabled(owner(r.path)))
+            app.include_router(part)
     from .routers import local_admin as local_admin_router
-    app.include_router(local_admin_router.agent)
-    app.include_router(local_admin_router.console)
     from .routers import device_profile as device_profile_router
-    app.include_router(device_profile_router.agent)
-    app.include_router(device_profile_router.console)
     from .routers import mobile as mobile_router
-    app.include_router(mobile_router.agent)
-    app.include_router(mobile_router.console)
-    app.include_router(web_profile_router.router)
-    app.include_router(web_profile_router.console)
     from .routers import elevation as elevation_router
-    app.include_router(elevation_router.agent)
-    app.include_router(elevation_router.console)
-    app.include_router(artifacts_router.agent)
-    app.include_router(artifacts_router.console)
-    app.include_router(remote_router.sockets)
-    app.include_router(oob_router.router)
-    app.include_router(oob_router.agent_router)
-    app.include_router(hybrid_router.router)
-    app.include_router(hybrid_router.agent_router)
-    app.include_router(network_router.agent)
-    app.include_router(grc_assurance_router.router)
-    app.include_router(grc_assurance_router.public)
-    app.include_router(protection.router)
-    app.include_router(protection.console)
-    app.include_router(customization_router.router)
+    if fenrir_apps.enabled("endpoint"):
+        # What agents call (one agent build serves every app that has devices): check-in and profile, uploads,
+        # phone location and lost mode, temporary admin and elevation requests, network scans, backup reports.
+        for router in (device_profile_router.agent, artifacts_router.agent, mobile_router.agent, local_admin_router.agent,
+                       elevation_router.agent, network_router.agent, oob_router.agent_router, hybrid_router.agent_router,
+                       backup_router.ingest):
+            app.include_router(router)
+        app.include_router(remote_router.sockets)
+        app.include_router(device_profile_router.console)
+        app.include_router(artifacts_router.console)
+    if fenrir_apps.enabled("rmm"):
+        app.include_router(local_admin_router.console)
+        app.include_router(elevation_router.console)
+        app.include_router(oob_router.router)
+    if fenrir_apps.enabled("mobile") or fenrir_apps.enabled("endpoint", "rmm"):
+        app.include_router(mobile_router.console)
+    if fenrir_apps.any_enabled("mobile", "av"):
+        app.include_router(web_profile_router.router)
+        app.include_router(web_profile_router.console)
+    if fenrir_apps.enabled("rmm", "m365"):
+        app.include_router(hybrid_router.router)  # AD-synced users: needs both the domain controller and Microsoft 365
+
+    @app.get("/api/app", tags=["System"])
+    def which_app():
+        """Which app this server runs; the dashboard shows only its pages."""
+        return fenrir_apps.describe()
 
     @app.get("/health", tags=["System"])
     def health():
@@ -642,6 +680,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         @app.get("/{path:path}", include_in_schema=False)
         def spa(path: str):
+            if path.startswith("api/"):  # an API this app does not serve: a real 404, never the console page
+                raise HTTPException(404, "Not Found")
             candidate = (console_dir / path).resolve()
             if path and console_dir.resolve() in candidate.parents and candidate.is_file():
                 # The service worker and manifest must always be re-checked, or installed apps never update.

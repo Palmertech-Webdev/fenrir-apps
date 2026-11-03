@@ -604,6 +604,8 @@ def run_step(db: Session, connection: M365Connection, flow: M365Workflow, step: 
         title = {"offboard": "Offboarding", "onboard": "New starter", "bulk_create": "New users"}[flow.kind]
         ticket = services.open_ticket(db, connection.tenant_id, f"{title}: {flow.target_name}"[:300], _summary(flow), source="microsoft-365",
                                       requester=flow.executed_by or flow.requested_by)
+        if ticket is None:
+            return "Skipped: tickets are part of the PSA, which this server does not run"
         flow.ticket_id = ticket.id
         return f"Ticket #{ticket.number} opened"
     if key == "create_user":

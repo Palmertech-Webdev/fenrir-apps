@@ -172,6 +172,8 @@ def _ticket_for(db: Session, principal: Principal, item: triage.Item) -> tuple[T
     ticket = services.open_ticket(db, item.tenant_id, item.title, "\n".join(lines).strip(),
                                   priority=triage.SEVERITY_PRIORITY[item.severity], source="triage",
                                   device_id=item.device_ids[0] if len(item.device_ids) == 1 else None)
+    if ticket is None:
+        raise HTTPException(409, "Tickets are part of the PSA, which this server does not run")
     if not ticket.assignee and item.owner and "," not in item.owner:
         ticket.assignee = item.owner
     if item.kind == "incident":

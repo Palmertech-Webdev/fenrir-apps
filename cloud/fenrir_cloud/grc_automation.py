@@ -265,8 +265,9 @@ def _raise_drift(db: Session, tenant: Tenant, key: str, signal: dict) -> None:
     description = ("A control that was passing is now failing. Affected common controls: " + ", ".join(controls) + ".\n\n"
                    + "\n".join(signal["evidence"][:10]))
     ticket = services.open_ticket(db, tenant.id, subject, description, priority="P2", source="compliance")
-    audit.record(db, "system:grc", "grc.drift", label(key), tenant.id, signal=key, controls=controls, ticket=ticket.id)
-    events.publish(db, "grc.drift", {"tenantId": tenant.id, "signal": key, "controls": controls, "ticketId": ticket.id}, tenant.id,
+    ticket_id = ticket.id if ticket else None  # None: no PSA on this server
+    audit.record(db, "system:grc", "grc.drift", label(key), tenant.id, signal=key, controls=controls, ticket=ticket_id)
+    events.publish(db, "grc.drift", {"tenantId": tenant.id, "signal": key, "controls": controls, "ticketId": ticket_id}, tenant.id,
                    key=f"grc.drift:{tenant.id}:{key}:{utcnow().strftime('%Y%m%d%H')}")
 
 

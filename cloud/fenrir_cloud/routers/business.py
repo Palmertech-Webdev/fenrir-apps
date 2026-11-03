@@ -20,6 +20,8 @@ from ..security import new_secret
 from ..serialize import apply_fields, to_dict
 
 router = APIRouter(prefix="/api/console", tags=["Business"])
+# Webhooks are part of every app (apps.py), so they have their own router.
+webhooks = APIRouter(prefix="/api/console", tags=["Webhooks"])
 
 
 def _crm_scope(principal: Principal) -> list[str]:
@@ -496,12 +498,12 @@ def xero_oauth_callback(state: str = "", code: str = "", error: str = "", db: Se
 # --------------------------------------------------------------------------- webhooks
 
 
-@router.get("/webhooks")
+@webhooks.get("/webhooks")
 def list_webhooks(principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     return [to_dict(w) for w in db.execute(select(Webhook).where(Webhook.tenant_id.in_(principal.tenant_ids))).scalars()]
 
 
-@router.post("/webhooks")
+@webhooks.post("/webhooks")
 def create_webhook(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("configure")
     tenant_id = body.get("tenantId") or principal.user.tenant_id
@@ -517,7 +519,7 @@ def create_webhook(body: dict = Body(...), principal: Principal = Depends(curren
     return {**to_dict(hook), "secret": hook.secret}
 
 
-@router.patch("/webhooks/{hook_id}")
+@webhooks.patch("/webhooks/{hook_id}")
 def update_webhook(hook_id: str, body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("configure")
     hook = _get(db, principal, Webhook, hook_id)
@@ -531,7 +533,7 @@ def update_webhook(hook_id: str, body: dict = Body(...), principal: Principal = 
     return to_dict(hook)
 
 
-@router.delete("/webhooks/{hook_id}")
+@webhooks.delete("/webhooks/{hook_id}")
 def delete_webhook(hook_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("configure")
     hook = _get(db, principal, Webhook, hook_id)

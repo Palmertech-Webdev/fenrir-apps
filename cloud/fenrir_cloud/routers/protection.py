@@ -457,6 +457,8 @@ def vulnerability_ticket(body: dict = Body(...), principal: Principal = Depends(
     if len({r.tenant_id for r in rows}) > 1 or len({r.vuln_id for r in rows}) > 1:
         raise HTTPException(400, "A remediation ticket covers one vulnerability for one customer")
     ticket = vulnmgmt.open_remediation_ticket(db, rows, principal.actor)
+    if ticket is None:
+        raise HTTPException(409, "Remediation tickets are part of the PSA, which this server does not run")
     db.commit()
     return {"ticketId": ticket.id, "number": ticket.number, "linked": len(rows)}
 

@@ -1112,7 +1112,7 @@ def _trigger(db: Session, condition: MonitorCondition, device: Device, state: Co
                                       priority, "rmm", "rmm-monitor", device_id=device.id,
                                       queue=str(action.get("board") or "Service Desk"))
         db.flush()
-        state.ticket_id = ticket.id
+        state.ticket_id = ticket.id if ticket else None
     for action in condition.actions or []:
         kind = action.get("type")
         if kind == "ticket":

@@ -72,11 +72,13 @@ import RecordingPlayer from "./pages/RecordingPlayer";
 import { DialogHost } from "./components/dialogs";
 import { CommandPalette, useSearchShortcut } from "./components/CommandPalette";
 import { api, setDefaultCurrency } from "./api";
+import { AppInfoProvider, pageAllowed, useAppInfo } from "./appinfo";
+import AppHome from "./pages/AppHome";
 
 // `also`: other pages of the same section (they switch with section tabs), so the entry stays highlighted on them.
 // Grouped by the job in hand rather than by module: work the queue, look after a client, look after their endpoints,
 // their identity and cloud, run the service desk and the business, prove compliance, then administration.
-const NAV: { group: string; items: { to: string; label: string; icon: string; also?: string[] }[] }[] = [
+export const NAV: { group: string; items: { to: string; label: string; icon: string; also?: string[] }[] }[] = [
   {
     group: "Triage",
     items: [
@@ -162,10 +164,18 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
     ],
   },
 ];
-const PAGES = NAV.flatMap((g) => g.items.map((i) => ({ to: i.to, label: i.label, group: g.group })));
+// The running app's menu: only the pages of its features (appinfo.tsx), and groups left empty are dropped.
+function useNav() {
+  const info = useAppInfo();
+  return NAV.map((g) => ({ ...g, items: g.items.filter((i) => pageAllowed(info, i.to)) })).filter((g) => g.items.length > 0);
+}
+function usePages() {
+  return useNav().flatMap((g) => g.items.map((i) => ({ to: i.to, label: i.label, icon: i.icon, group: g.group })));
+}
 
 function Login() {
   const { login, completeSso, loginWithPasskey } = useApp();
+  const app = useAppInfo();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
@@ -224,7 +234,7 @@ function Login() {
       <form className="card" onSubmit={submit}>
         <div className="brand" style={{ padding: 0, marginBottom: 20 }}>
           <div className="brand-mark">F</div>
-          <div><b>Fenrir Console</b><small>Endpoint · SIEM · Exposure · PSA</small></div>
+          <div><b>{app.title}</b><small>{app.key === "complete" ? "Endpoint · SIEM · Exposure · PSA" : app.summary}</small></div>
         </div>
         {microsoft}
         {sso?.required && !showPassword && <p className="small muted" style={{ marginTop: 12 }}>
@@ -258,6 +268,12 @@ const BOTTOM_NAV = [
 function Shell() {
   const { me, tenantId, setTenantId, logout } = useApp();
   const location = useLocation();
+  const app = useAppInfo();
+  const nav = useNav();
+  const pages = usePages();
+  const bottomNav = BOTTOM_NAV.filter((i) => pageAllowed(app, i.to));
+  // The security overview needs the Antivirus app; every other app has its own home page.
+  const home = app.features.includes("av") ? <Overview /> : <AppHome pages={pages} />;
   useEffect(() => { api<{ currency: string }>("region").then((r) => setDefaultCurrency(r.currency)).catch(() => undefined); }, [me?.user.id]);
   const [navOpen, setNavOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -276,14 +292,14 @@ function Shell() {
     <div className={`shell ${navOpen ? "nav-open" : ""}`}>
       <div className="nav-backdrop" onClick={() => setNavOpen(false)} aria-hidden />
       <aside className="sidebar" aria-label="Main menu">
-        <div className="brand"><div className="brand-mark">F</div><div><b>Fenrir</b><small>Unified security platform</small></div>
+        <div className="brand"><div className="brand-mark">F</div><div><b>{app.title}</b><small>{app.key === "complete" ? "Unified security platform" : app.summary.split(":")[0]}</small></div>
           <button className="ghost nav-close" aria-label="Close menu" onClick={() => setNavOpen(false)}>✕</button></div>
         <div className="nav-account">
           <div className="small">{me.user.email}</div>
           <div className="small muted">{me.user.role.replace(/_/g, " ")}</div>
           <button className="small" onClick={logout}>Sign out</button>
         </div>
-        {NAV.map((group) => (
+        {nav.map((group) => (
           <div key={group.group}>
             <div className="nav-group">{group.group}</div>
             {group.items.map((item) => (
@@ -312,8 +328,10 @@ function Shell() {
             <b>Emergency stop is on.</b> Nothing but isolation reaches devices. {me.emergencyStop.reason} ({me.emergencyStop.by}). A platform
             administrator can lift it in Settings → Platform.</div>}
           <PageBoundary resetKey={`${location.pathname}${location.search}`}>
+          {/* A page from another app (an old link or bookmark) goes to this app's home page. */}
+          {!pageAllowed(app, location.pathname) ? <Navigate to="/" replace /> :
           <Routes>
-            <Route path="/" element={<Overview />} />
+            <Route path="/" element={home} />
             <Route path="/inbox" element={<Inbox />} />
             <Route path="/devices" element={<Devices />} />
             <Route path="/devices/:id" element={<DeviceDetail />} />
@@ -379,12 +397,12 @@ function Shell() {
             <Route path="/backup" element={<Backup />} />
             <Route path="/soc-workflows" element={<SocWorkflows />} />
             <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          </Routes>}
           </PageBoundary>
         </main>
-        {searchOpen && <CommandPalette pages={PAGES} onClose={() => setSearchOpen(false)} />}
+        {searchOpen && <CommandPalette pages={pages} onClose={() => setSearchOpen(false)} />}
         <nav className="bottom-nav" aria-label="Quick navigation">
-          {BOTTOM_NAV.map((item) => (
+          {bottomNav.map((item) => (
             <NavLink key={item.to} to={item.to} end={item.to === "/"} className={({ isActive }) => isActive ? "active" : ""}>
               <span aria-hidden>{item.icon}</span>{item.label}
             </NavLink>
@@ -397,7 +415,7 @@ function Shell() {
 }
 
 export function Root() {
-  return <><RootContent /><DialogHost /></>;
+  return <AppInfoProvider><RootContent /><DialogHost /></AppInfoProvider>;
 }
 
 function RootContent() {

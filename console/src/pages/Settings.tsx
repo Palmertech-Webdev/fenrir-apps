@@ -4,6 +4,7 @@ import { GroupsManager } from "../components/Groups";
 import { useState } from "react";
 import { ago, api, downloadFile, fmtTime, setToken } from "../api";
 import { useApp } from "../app-context";
+import { useFeature } from "../appinfo";
 import { Modal, PageHead, Pill, Table, Tabs, TenantSelect, useAction, useData, useListData } from "../components/ui";
 import { confirmDialog, promptDialog } from "../components/dialogs";
 import { addPasskey, passkeysSupported } from "../passkeys";
@@ -14,7 +15,8 @@ const ROLES = ["platform_admin", "msp_admin", "soc_analyst", "technician", "bill
 
 export default function Settings() {
   const { can } = useApp();
-  const tabs = ["Tenants", "Users", "Groups", "Custom fields", "Region & holidays", "Webhooks", ...(can("configure") ? ["API credentials"] : []), "Approvals", "Agent releases", "Audit log", ...(can("configure") ? ["Platform"] : []), "Account"];
+  const devices = useFeature("endpoint");  // device groups and agent releases are for apps with devices
+  const tabs = ["Tenants", "Users", ...(devices ? ["Groups"] : []), "Custom fields", "Region & holidays", "Webhooks", ...(can("configure") ? ["API credentials"] : []), "Approvals", ...(devices ? ["Agent releases"] : []), "Audit log", ...(can("configure") ? ["Platform"] : []), "Account"];
   const [params] = useSearchParams();
   const [tab, setTab] = useState(() => { const asked = params.get("tab"); return asked && tabs.includes(asked) ? asked : "Tenants"; });
   return (
@@ -99,9 +101,12 @@ function UsersTab() {
   const [assigning, setAssigning] = useState<any>(null);
   const [roleForm, setRoleForm] = useState<any>(null);
   const { run, busy } = useAction();
+  const psa = useFeature("psa");
   const customRoles: any[] = roleData?.custom || [];
   const roleLabel = (role: string) => customRoles.find((r) => r.role === role)?.name || role.replace(/_/g, " ");
-  const roleOptions = [...ROLES.map((r) => ({ value: r, label: r.replace(/_/g, " ") })), ...customRoles.map((r) => ({ value: r.role, label: `${r.name} (custom)` }))];
+  // Client portal accounts (a customer's contact): only where the PSA, which owns the portal, runs.
+  const roles = psa ? [...ROLES, "client"] : ROLES;
+  const roleOptions = [...roles.map((r) => ({ value: r, label: r === "client" ? "client (customer portal)" : r.replace(/_/g, " ") })), ...customRoles.map((r) => ({ value: r.role, label: `${r.name} (custom)` }))];
   return (
     <div className="card">
       {can("configure") && roleData && (

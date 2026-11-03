@@ -165,6 +165,8 @@ def _note(db: Session, vuln: Vulnerability, text: str) -> None:
     from . import psa
 
     ticket = _ticket_for(db, vuln)
+    if ticket is None:  # no PSA on this server: the vulnerability's own history is the record
+        return
     host = db.execute(select(Device.hostname).where(Device.id == vuln.device_id)).scalar() or vuln.device_id
     psa.add_note(db, ticket, "system:remediation", f"{vuln.vuln_id} on {host}: {text}", kind="internal")
 

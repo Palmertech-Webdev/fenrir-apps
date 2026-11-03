@@ -211,8 +211,8 @@ def expire_acceptances(db: Session, now: datetime | None = None) -> int:
     return len(rows)
 
 
-def open_remediation_ticket(db: Session, vulns: list[Vulnerability], actor: str) -> Ticket:
-    """One ticket for one CVE across the given devices of a tenant; links every row to it."""
+def open_remediation_ticket(db: Session, vulns: list[Vulnerability], actor: str) -> Ticket | None:
+    """One ticket for one CVE across the given devices of a tenant; links every row to it. None without the PSA."""
     first = vulns[0]
     hosts = dict(db.execute(select(Device.id, Device.hostname).where(Device.id.in_({v.device_id for v in vulns}))).all())
     lines = [f"- {hosts.get(v.device_id, v.device_id)}: {v.package} {v.installed_version}" for v in vulns]
@@ -222,6 +222,8 @@ def open_remediation_ticket(db: Session, vulns: list[Vulnerability], actor: str)
     ticket = services.open_ticket(db, first.tenant_id, f"Remediate {first.vuln_id} on {len(vulns)} device(s)", description,
                                   priority=priority(first), source="vulnerability", requester=actor,
                                   device_id=first.device_id if len(vulns) == 1 else None)
+    if ticket is None:
+        return None
     for vuln in vulns:
         vuln.ticket_id = ticket.id
         if vuln.status == "open":

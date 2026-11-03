@@ -327,7 +327,8 @@ def tick(db: Session) -> None:
                 ticket = services.open_ticket(db, vendor.tenant_id, f"Supplier review due: {vendor.name}",
                                               f"{vendor.name} ({vendor.criticality} criticality, {vendor.data_access} data) is due for its "
                                               f"security review. Residual risk: {vendor.risk_tier}.", priority="P3", source="compliance")
-                vendor.review_ticket_id = ticket.id
+                # Without the PSA there is no ticket; the marker still stops the review being raised again every day.
+                vendor.review_ticket_id = ticket.id if ticket else "review-due"
                 if vendor.contact_email and ((db.get(Tenant, vendor.tenant_id).settings or {}).get("tprm") or {}).get("autoReassess", True):
                     send_assessment(db, vendor, "system:tprm")
             due = _documents_due(vendor, now)

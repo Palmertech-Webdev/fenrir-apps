@@ -381,7 +381,7 @@ def _maybe_ticket(db: Session, package: ConditionPackage, device: Device, row: C
                                   f"The condition '{package.name}' is still present after remediation.\n\nLast detection output:\n"
                                   f"{row.detect_output}\n\nRemediation output:\n{row.remediate_output}",
                                   priority="P3", source="condition-remediation", device_id=device.id)
-    row.ticket_id = ticket.id
+    row.ticket_id = ticket.id if ticket else None
 
 
 def view(package: ConditionPackage, results: list[ConditionResult] | None = None, db: Session | None = None) -> dict:

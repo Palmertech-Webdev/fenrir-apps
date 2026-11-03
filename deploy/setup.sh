@@ -3,18 +3,20 @@
 # HTTPS proxy configuration and the release-signing key, and can build and start Fenrir.
 #
 #   deploy/setup.sh                 ask everything
-#   deploy/setup.sh --domain rmm.example.org --email you@example.org --name "Example IT" --yes
+#   deploy/setup.sh --app rmm --domain rmm.example.org --email you@example.org --name "Example IT" --yes
 #
-# Options: --domain, --email, --name, --feed URL (optional signature feed), --no-certificate (unsigned Windows
-# agents, lab profile), --yes (no questions; needs --domain and --email), --no-start.
+# Options: --app (complete, rmm, av, vuln, crm, psa, grc, m365, mobile or docs; see apps/README.md), --domain,
+# --email, --name, --feed URL (optional signature feed), --no-certificate (unsigned Windows agents, lab profile),
+# --yes (no questions; needs --domain and --email), --no-start.
 # It never overwrites an existing deploy/.env: an existing installation keeps its secrets (see README "Updates").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DOMAIN="${FENRIR_SETUP_DOMAIN:-}"; EMAIL="${FENRIR_SETUP_EMAIL:-}"; NAME="${FENRIR_SETUP_NAME:-}"; FEED=""
+APP="${FENRIR_SETUP_APP:-}"; DOMAIN="${FENRIR_SETUP_DOMAIN:-}"; EMAIL="${FENRIR_SETUP_EMAIL:-}"; NAME="${FENRIR_SETUP_NAME:-}"; FEED=""
 CERT=""; YES=false; START=ask
 while [ $# -gt 0 ]; do
   case "$1" in
+    --app) APP="$2"; shift 2 ;;
     --domain) DOMAIN="$2"; shift 2 ;;
     --email) EMAIL="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
@@ -22,7 +24,7 @@ while [ $# -gt 0 ]; do
     --no-certificate) CERT=no; shift ;;
     --yes|-y) YES=true; shift ;;
     --no-start) START=no; shift ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -47,6 +49,26 @@ command -v openssl >/dev/null || die "openssl is required (sudo apt-get install 
 say "Fenrir setup"
 say "Fenrir is reached at one domain name (for example rmm.yourcompany.com) that points at this server."
 say ""
+
+# Which app: the complete platform, or one app on its own (apps/<app>/README.md describes each).
+APPS="complete rmm av vuln crm psa grc m365 mobile docs"
+if [ -z "$APP" ] && ! $YES; then
+  say "Which app should this server run?"
+  say "  complete  everything in one console        rmm     remote monitoring and management"
+  say "  av        antivirus and EDR                vuln    vulnerability management"
+  say "  crm       customer relationship management psa     tickets, time, projects and billing"
+  say "  grc       governance, risk and compliance  m365    Microsoft 365 administration"
+  say "  mobile    phone management                 docs    IT documentation and credential vault"
+fi
+while :; do
+  ask APP "App" "complete"
+  APP="$(printf '%s' "$APP" | tr 'A-Z' 'a-z')"
+  case " $APPS " in *" $APP "*) break ;; esac
+  $YES && die "--app must be one of: $APPS."
+  say "  Choose one of: $APPS"; APP=""
+done
+# Apps that manage devices build and serve agents; the others never need a code-signing certificate.
+case "$APP" in complete|rmm|av|vuln|mobile) DEVICES=true ;; *) DEVICES=false; CERT="${CERT:-no}" ;; esac
 
 # Domain: a hostname only, which you control and which points at this server.
 while :; do
@@ -78,7 +100,7 @@ if [ -z "$CERT" ] && ! $YES; then
 fi
 CERT="${CERT:-no}"
 
-if [ -z "$FEED" ] && ! $YES; then
+if [ -z "$FEED" ] && ! $YES && { [ "$APP" = complete ] || [ "$APP" = av ]; }; then
   read -r -p "Signature feed URL (optional; press Enter to skip): " FEED
 fi
 
@@ -94,6 +116,7 @@ admin_password="$(hex 12)"
   mkdir -p deploy/signing deploy/releases
   chmod 700 deploy/signing
   sed \
+    -e "s|^FENRIR_APP=.*|FENRIR_APP=$APP|" \
     -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(hex 32)|" \
     -e "s|^FENRIR_SECRET_KEY=.*|FENRIR_SECRET_KEY=$(hex 32)|" \
     -e "s|^FENRIR_PUBLIC_URL=.*|FENRIR_PUBLIC_URL=https://$DOMAIN|" \
@@ -130,11 +153,14 @@ say ""
 say "Written: deploy/.env (fresh secrets), deploy/docker-compose.https.yml, deploy/Caddyfile, deploy/signing/release-ed25519.pem."
 say "Keep a copy of deploy/.env and deploy/signing/ somewhere safe: without them stored secrets and agent updates cannot be recovered."
 say ""
+say "App:            $APP (change FENRIR_APP in deploy/.env and restart to switch; your data is kept)"
 say "First sign-in:  https://$DOMAIN"
 say "  Email:        $EMAIL"
 say "  Password:     $admin_password   (shown once; change it after signing in)"
 say ""
-if [ "$CERT" = yes ]; then
+if ! $DEVICES; then
+  say "This app has no device agents, so no code-signing certificate is needed."
+elif [ "$CERT" = yes ]; then
   say "Put your certificate in place before the first build:"
   say "  deploy/signing/codesign.pfx and its password in deploy/signing/codesign.password (see docs/CODE_SIGNING.md)."
 else

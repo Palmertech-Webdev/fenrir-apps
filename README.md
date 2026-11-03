@@ -30,8 +30,28 @@ machines before you rely on it.
 
 Hosting, a domain and a publicly trusted code-signing certificate cost money; everything else is free.
 
+## Run everything, or one app
+
+Fenrir runs as the **complete** platform (everything below, joined up) or as **one app on its own**, each with its
+own dashboard, README and full guide. Choose during setup (`deploy/setup.sh --app rmm`) or set `FENRIR_APP` in
+`deploy/.env`; you can switch later and keep your data. See [the apps](apps/README.md).
+
+| App | `FENRIR_APP` | What it is |
+|---|---|---|
+| Fenrir (this README) | `complete` | Every app in one console. |
+| [Fenrir RMM](apps/rmm/README.md) | `rmm` | Remote monitoring and management for the devices you look after. |
+| [Fenrir Antivirus](apps/av/README.md) | `av` | Endpoint protection: antivirus and EDR with a security operations console. |
+| [Fenrir Vulnerability Manager](apps/vuln/README.md) | `vuln` | Find, rank and fix vulnerabilities, and prove they are fixed. |
+| [Fenrir CRM](apps/crm/README.md) | `crm` | Customer relationship management for IT service businesses. |
+| [Fenrir PSA](apps/psa/README.md) | `psa` | Professional services automation: the service desk and the business behind it. |
+| [Fenrir GRC](apps/grc/README.md) | `grc` | Governance, risk and compliance programmes you can evidence. |
+| [Fenrir Microsoft 365](apps/m365/README.md) | `m365` | Microsoft 365 administration across all your customers' tenants. |
+| [Fenrir Mobile](apps/mobile/README.md) | `mobile` | Phone management: Android phones and web protection for Apple devices. |
+| [Fenrir Docs & Vault](apps/docs/README.md) | `docs` | IT documentation and an encrypted credential vault. |
+
 ## Contents
 
+- [Run everything, or one app](#run-everything-or-one-app)
 - [Start here: your own copy](#start-here-your-own-copy)
 - [Components](#components)
 - [Requirements](#requirements)
@@ -145,6 +165,8 @@ deploy/setup.sh
 
 Setup asks for:
 
+- **Which app** this server runs: `complete` (everything, the default) or one app on its own (see
+  [the apps](apps/README.md)).
 - **Your domain name** (for example `rmm.yourcompany.com`): a DNS A record for it must point at this server. Fenrir is
   served there over HTTPS, agents and phones connect to it, and its certificate is issued for it automatically.
 - **An administrator email**: your first sign-in, and the contact for the HTTPS certificate.
@@ -155,7 +177,7 @@ Setup asks for:
 
 It writes `deploy/.env` with fresh random secrets, the HTTPS proxy files and the release-signing key, prints the first
 administrator password once, and can build and start Fenrir. It never overwrites an existing `deploy/.env`. For a
-scripted install: `deploy/setup.sh --domain rmm.yourcompany.com --email you@yourcompany.com --name "Your Company" --yes`.
+scripted install: `deploy/setup.sh --app complete --domain rmm.yourcompany.com --email you@yourcompany.com --name "Your Company" --yes`.
 Steps 3 and 4 below are then done; continue at step 5 with the compose files setup printed (also in
 `deploy/.compose-files`).
 
