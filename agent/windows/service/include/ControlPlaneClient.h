@@ -1,0 +1,179 @@
+#pragma once
+
+#include <stdexcept>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include "AgentState.h"
+#include "PolicySnapshot.h"
+#include "TelemetryRecord.h"
+#include "ThreatIntelligence.h"
+
+namespace antivirus::agent {
+
+struct EnrollmentResult {
+  std::wstring deviceId;
+  std::wstring issuedAt;
+  std::wstring commandChannelUrl;
+  PolicySnapshot policy;
+};
+
+struct HeartbeatResult {
+  std::wstring receivedAt;
+  std::wstring effectivePolicyRevision;
+  int commandsPending{0};
+  bool rotateKey{false};  // the control plane wants this device to replace its API key
+};
+
+struct PolicyCheckInResult {
+  std::wstring retrievedAt;
+  bool changed{false};
+  PolicySnapshot policy;
+};
+
+struct TelemetryBatchResult {
+  std::wstring receivedAt;
+  int accepted{0};
+  int totalStored{0};
+};
+
+struct RemoteCommand {
+  std::wstring commandId;
+  std::wstring type;
+  std::wstring issuedBy;
+  std::wstring createdAt;
+  std::wstring updatedAt;
+  std::wstring targetPath;
+  std::wstring recordId;
+  std::wstring payloadJson;
+  std::wstring callerSid;  // local pipe only: the signed-in user who sent the command
+};
+
+struct CommandPollResult {
+  std::wstring polledAt;
+  std::vector<RemoteCommand> items;
+};
+
+struct ControlPlaneUpdateOffer {
+  std::wstring packageId;
+  std::wstring packageType;
+  std::wstring targetVersion;
+  std::wstring manifestPath;
+  bool mandatory{false};
+};
+
+struct UpdateCheckResult {
+  std::wstring checkedAt;
+  std::vector<ControlPlaneUpdateOffer> items;
+};
+
+struct SignatureRuleDelta {
+  std::wstring scope;
+  std::wstring code;
+  std::wstring message;
+  std::wstring tacticId;
+  std::wstring techniqueId;
+  int score{0};
+  std::vector<std::wstring> patterns;
+};
+
+struct SignatureDeltaResult {
+  std::wstring checkedAt;
+  std::wstring signatureVersion;
+  std::wstring yaraVersion;
+  std::vector<SignatureRuleDelta> signatures;
+  std::vector<std::wstring> yaraRules;
+  std::vector<ThreatIntelRecord> threatIntelRecords;
+};
+
+class DeviceIdentityRejectedError final : public std::runtime_error {
+ public:
+  explicit DeviceIdentityRejectedError(const std::string& message) : std::runtime_error(message) {}
+};
+
+// The server answered with a non-2xx status. 400, 413 and 422 mean it will never accept that request as sent.
+class HttpStatusError final : public std::runtime_error {
+ public:
+  HttpStatusError(const unsigned long statusCode, const std::string& message)
+      : std::runtime_error(message), statusCode_(statusCode) {}
+  unsigned long StatusCode() const noexcept { return statusCode_; }
+  bool Malformed() const noexcept { return statusCode_ == 400 || statusCode_ == 413 || statusCode_ == 422; }
+
+ private:
+  unsigned long statusCode_;
+};
+
+// The Windows agent build the server ships (GET /api/v1/agent/update/windows).
+struct AgentPackageInfo {
+  bool available{false};
+  bool autoUpdate{true};
+  std::wstring buildId;
+  std::wstring sha256;
+  std::wstring url;  // server-relative
+};
+
+struct MlModelManifest {
+  std::wstring version;
+  std::wstring sha256;
+  long long size{0};
+};
+
+class ControlPlaneClient {
+ public:
+  explicit ControlPlaneClient(std::wstring baseUrl);
+
+  // enrollmentToken comes from the console (Deploy agents); without one the device lands in Unassigned.
+  EnrollmentResult Enroll(const AgentState& state, const std::wstring& enrollmentToken = {}) const;
+  // metricsJson: the RMM health object (CPU, memory, disks...) or empty.
+  HeartbeatResult SendHeartbeat(const AgentState& state, const std::string& metricsJson = "") const;
+  // A bare "still here" check-in (no state changes), for when the live connection is down and the main loop is busy.
+  void SendPresence(const AgentState& state) const;
+  // Asks for a new device API key and returns the command channel URL that carries it. The current key keeps working
+  // until the new one is first used, so the caller saves the URL before switching to it.
+  std::wstring RotateDeviceKey(const AgentState& state) const;
+  // 'Request support' from the agent window; returns the ticket number. bodyJson: {summary, details, user, contact}.
+  std::wstring SubmitSupportRequest(const AgentState& state, const std::string& bodyJson) const;
+  // POST /elevation-requests; returns the response body ({"id","status","minutes"}).
+  std::string RequestElevation(const AgentState& state, const std::string& bodyJson) const;
+  // POST /elevation-requests/<id>/events: a program launched as the temporary administrator, or the session's end.
+  void ReportElevationEvent(const AgentState& state, const std::wstring& requestId, const std::string& bodyJson) const;
+  // POST /commands/<id>/amt-credential: the AMT connection details for one amt.wsman command, released once.
+  std::string FetchAmtCredential(const AgentState& state, const std::wstring& commandId) const;
+  // POST /commands/<id>/secret: the one-time secret of one ad.directory command ({"secret": "..."}), released once.
+  std::string FetchCommandSecret(const AgentState& state, const std::wstring& commandId) const;
+  // POST /profile with the system profile document ({"profile":..., "recoveryKeys":[...]}).
+  void SendSystemProfile(const AgentState& state, const std::string& bodyJson) const;
+  // ws(s)://.../api/v1/devices/<id>/realtime and the device key that authenticates it.
+  std::wstring RealtimeUrl(const AgentState& state) const;
+  static std::wstring DeviceApiKey(const AgentState& state);
+  PolicyCheckInResult CheckInPolicy(const AgentState& state) const;
+  TelemetryBatchResult SendTelemetryBatch(const AgentState& state, const std::vector<TelemetryRecord>& records) const;
+  // types: optional comma-separated command types to fetch (servers without the filter return everything).
+  CommandPollResult PollPendingCommands(const AgentState& state, int limit = 10, const std::wstring& types = L"") const;
+  bool CommandStopRequested(const AgentState& state, const std::wstring& commandId) const;
+  // Uploads a forensic/support bundle for a command (before it is completed); returns the artifact id.
+  std::wstring UploadCommandArtifact(const AgentState& state, const std::wstring& commandId, const std::wstring& filename,
+                                     const std::string& data) const;
+  void CompleteCommand(const AgentState& state, const std::wstring& commandId, const std::wstring& status,
+                       const std::wstring& resultJson) const;
+  UpdateCheckResult CheckForUpdates(const AgentState& state, const std::wstring& signaturesVersion = L"",
+                                    const std::wstring& channel = L"") const;
+  SignatureDeltaResult FetchSignatureDelta(const std::wstring& currentSignatureVersion = L"",
+                                           const std::wstring& currentYaraVersion = L"",
+                                           const std::wstring& signatureFeedToken = L"") const;
+  // Static ML model: manifest {version, sha256, size} and the FGBT binary.
+  MlModelManifest FetchMlModelManifest(const AgentState& state) const;
+  std::vector<unsigned char> DownloadMlModel(const AgentState& state) const;
+  AgentPackageInfo CheckWindowsAgentUpdate(const AgentState& state) const;
+  // Local admin password rotation: escrow returns the version id; confirm reports whether it was applied.
+  std::wstring EscrowLocalAdminPassword(const AgentState& state, const std::wstring& account, const std::wstring& password) const;
+  void ConfirmLocalAdminPassword(const AgentState& state, const std::wstring& version, bool applied, const std::wstring& error) const;
+  // Downloads a server-relative /api/v1/ path with the device key into target.
+  void DownloadToFile(const AgentState& state, const std::wstring& path, const std::filesystem::path& target) const;
+
+ private:
+  std::wstring baseUrl_;
+};
+
+}  // namespace antivirus::agent

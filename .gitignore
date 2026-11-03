@@ -1,0 +1,51 @@
+node_modules/
+dist/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+.env.local
+npm-debug.log*
+backend/control-plane/data/state.json
+backend/control-plane/.data/
+agent/windows/service/build/
+agent/windows/service/build-*/
+agent/windows/service/build-buttonfix/
+agent/windows/service/runtime/
+agent/windows/out/
+tmp-phase2-corpora/
+tmp-phase2-exitcriteria/
+tmp-phase3-corpora/
+tmp-phase3-exitcriteria/
+tmp-*
+probe-*
+
+# Fenrir Cloud
+__pycache__/
+*.pyc
+.pytest_cache/
+cloud/fenrir.db*
+cloud/downloads/
+dist/
+deploy/.env
+cloud/data/
+
+# Signed installer staging directory (do not commit customer release binaries)
+deploy/releases/
+deploy/auto-update.env
+
+# Code-signing certificate and password (server only)
+deploy/signing/*
+!deploy/signing/README.md
+.venv/
+
+.venv/
+.venv*
+agent/windows/service/build-quiet*
+*.zip
+!components/**/*.zip
+
+# Written by deploy/setup.sh for one installation (never commit: secrets and per-server files)
+deploy/.compose-files
+deploy/Caddyfile
+deploy/docker-compose.https.yml

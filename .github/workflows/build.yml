@@ -1,0 +1,71 @@
+name: Fenrir Multi-OS Build Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "fix/**", "feat/**" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-windows:
+    name: Windows Agent (MSVC + CMake)
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake (development build without signed minifilter)
+      run: cmake -B build -S agent/windows/service -DANTIVIRUS_REQUIRE_MINIFILTER_PAYLOAD=OFF
+
+    - name: Build Windows agent and real native FenrirSetup
+      run: cmake --build build --config Release --target antivirus-setup
+
+    - name: Verify installer and agent binary outputs
+      shell: pwsh
+      run: |
+        $agent = 'agent/windows/out/dev/fenrir-agent-service.exe'
+        $setup = 'agent/windows/out/install/FenrirSetup.exe'
+        foreach ($file in @($agent, $setup)) {
+          if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw "Expected build output missing: $file"
+          }
+          Get-FileHash -Algorithm SHA256 -LiteralPath $file | Format-List
+        }
+        & $agent --help
+        if ($LASTEXITCODE -ne 0) { throw "Built service --help returned $LASTEXITCODE" }
+        Write-Warning 'Unsigned development artifacts only. Not approved for customer installation or kernel antimalware claims.'
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Fenrir-Windows-UNSIGNED-CI
+        path: |
+          agent/windows/out/install/FenrirSetup.exe
+          agent/windows/out/dev/fenrir-agent-service.exe
+        if-no-files-found: error
+
+  # The Linux agent is built by platform.yml (managed agent + .deb packages).
+
+  build-macos:
+    name: macOS Agent (Swift + EndpointSecurity)
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build Swift Package
+      working-directory: agent/macos
+      run: swift build -c release
+
+    - name: Sign macOS Binary (Placeholder)
+      run: |
+        echo "Requires secrets.APPLE_CERTIFICATE for Endpoint Security Entitlement"
+        # codesign --force --options runtime --sign "${{ secrets.APPLE_CERT_ID }}" --entitlements entitlements.plist .build/release/fenrir-agent
+
+    - name: Create PKG Installer
+      run: |
+        echo "Placeholder: pkgbuild --root .build/release --identifier com.fenrir.agent FenrirAgent.pkg"
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Fenrir-macOS
+        path: agent/macos/.build/release/fenrir-agent
+        if-no-files-found: error

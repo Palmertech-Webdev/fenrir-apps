@@ -1,0 +1,686 @@
+"""DNS protection, threat intel, vulnerabilities, attack surface, compliance."""
+
+from __future__ import annotations
+
+from collections import Counter
+from datetime import timedelta
+
+import dns.exception
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request, Response
+from starlette.requests import ClientDisconnect
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from .. import audit, blocklists, compliance, dnsfilter, exposure, intel, services, vulnmgmt, web_profile
+from ..config import get_settings
+from ..db import get_db, session_factory
+from ..deps import Principal, current_principal, scoped_tenant
+from ..models import Device, DnsQueryLog, ExternalAsset, Indicator, Tenant, Vulnerability, YaraRule, utcnow
+from ..serialize import apply_fields, to_dict
+
+router = APIRouter(tags=["Protection"])
+console = APIRouter(prefix="/api/console", tags=["Protection"])
+
+DNS_MESSAGE = "application/dns-message"
+
+
+# --------------------------------------------------------------------------- DNS over HTTPS
+
+
+def _dns_device(db: Session, token: str) -> Device:
+    device = db.execute(select(Device).where(Device.dns_token == token)).scalar_one_or_none()
+    # A decommissioned iPhone or Mac still has the profile until someone removes it: it gets plain answers meanwhile.
+    if device is None or (device.api_key_hash.startswith("retired-") and not web_profile.agentless(device)):
+        raise HTTPException(404, "Unknown resolver")
+    return device
+
+
+def _doh(db: Session, device: Device, wire: bytes, request: Request | None = None) -> Response:
+    settings = get_settings()
+    resolution, _ = services.effective_policy(db, device)
+    dns_settings = resolution["settings"]["dns"]
+    if web_profile.agentless(device):
+        dns_settings = web_profile.resolver_settings(device, dns_settings)
+        web_profile.touch(db, device, request.client.host if request is not None and request.client else "")
+    if not dns_settings["enabled"]:
+        dns_settings = {**dns_settings, "blockedCategories": [], "blockDomains": [], "mode": "observe", "logQueries": "none"}
+    try:
+        answer, decision = dnsfilter.resolve(db, device, wire, dns_settings, settings.dns_upstream, settings.dns_sinkhole_ipv4)
+    except dns.exception.DNSException as exc:
+        raise HTTPException(400, f"Malformed DNS message: {exc}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Upstream resolver failed: {exc}") from exc
+    db.commit()
+    # The agent's local DNS proxy caches these so a blocked name stays blocked while the device is offline.
+    reason = (decision.reason or "").encode("ascii", "replace").decode()[:200]
+    return Response(content=answer, media_type=DNS_MESSAGE, headers={"Cache-Control": "max-age=30",
+                                                                     "X-Fenrir-Dns-Action": decision.action,
+                                                                     "X-Fenrir-Dns-Reason": reason})
+
+
+@router.get("/dns/{token}/dns-query", include_in_schema=False)
+def doh_get(token: str, request: Request, dns_param: str = Query(alias="dns"), db: Session = Depends(get_db)):
+    try:
+        wire = dnsfilter.decode_get_param(dns_param)
+    except ValueError as exc:
+        raise HTTPException(400, "dns parameter is not base64url") from exc
+    return _doh(db, _dns_device(db, token), wire, request)
+
+
+@router.post("/dns/{token}/dns-query", include_in_schema=False)
+async def doh_post(token: str, request: Request, db: Session = Depends(get_db)):
+    if request.headers.get("content-type", "").split(";")[0] != DNS_MESSAGE:
+        raise HTTPException(415, f"Content-Type must be {DNS_MESSAGE}")
+    try:
+        wire = await request.body()
+    except ClientDisconnect:
+        # The device gave up on this lookup (it retries); nothing to answer and nothing worth a traceback.
+        return Response(status_code=499)
+    if len(wire) > 4096:
+        raise HTTPException(413, "DNS message too large")
+    return _doh(db, _dns_device(db, token), wire, request)
+
+
+@console.get("/dns/check")
+def dns_check(domain: str, device_id: str | None = None, tenant_id: str | None = None,
+              principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Explain what DNS protection would do for a domain."""
+    if device_id:
+        device = db.get(Device, device_id)
+        if device is None:
+            raise HTTPException(404, "Not found")
+        principal.check_tenant(device.tenant_id)
+        resolution, _ = services.effective_policy(db, device)
+        tid = device.tenant_id
+    else:
+        tid = scoped_tenant(principal, tenant_id)[0] if tenant_id else principal.user.tenant_id
+        from ..policy_schema import resolve
+
+        resolution = resolve(services.policy_layers(db, db.get(Tenant, tid)))
+    decision = dnsfilter.decide(domain, resolution["settings"]["dns"], dnsfilter.INTEL.domains(db, tid), blocklists.CACHE.active(db))
+    return {"domain": domain, "action": decision.action, "reason": decision.reason or "no match", "category": decision.category,
+            "rewrite": decision.rewrite, "dgaScore": dnsfilter.looks_like_dga(domain.lower())}
+
+
+@console.get("/dns/log")
+def dns_log(tenant_id: str | None = None, action: str | None = None, hours: int = 24,
+            principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    scope = scoped_tenant(principal, tenant_id)
+    query = select(DnsQueryLog).where(DnsQueryLog.tenant_id.in_(scope), DnsQueryLog.at >= utcnow() - timedelta(hours=hours))
+    if action:
+        query = query.where(DnsQueryLog.action == action)
+    rows = db.execute(query.order_by(DnsQueryLog.at.desc()).limit(1000)).scalars().all()
+    categories = Counter(r.category for r in rows if r.action == "block")
+    domains = Counter(r.qname for r in rows if r.action == "block")
+    return {"entries": [to_dict(r) for r in rows], "topCategories": categories.most_common(10), "topDomains": domains.most_common(10)}
+
+
+@console.get("/dns/blocklists")
+def list_blocklists(principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("read")
+    blocklists.ensure_builtin(db)
+    db.commit()
+    rows = db.execute(select(blocklists.DnsBlocklist).order_by(blocklists.DnsBlocklist.builtin.desc(), blocklists.DnsBlocklist.id)).scalars()
+    return [blocklists.view(row) for row in rows]
+
+
+def _blocklist(db: Session, key: str):
+    row = db.get(blocklists.DnsBlocklist, key)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    return row
+
+
+@console.post("/dns/blocklists")
+def create_blocklist(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Add a custom domain list (hosts, AdBlock or plain domains). Lists apply platform-wide."""
+    principal.require("platform")
+    key = str(body.get("id") or "").strip().lower()
+    url = str(body.get("url") or "").strip()
+    if not key or not key.replace("-", "").isalnum() or len(key) > 40:
+        raise HTTPException(422, "id must be up to 40 letters, digits or hyphens")
+    if not url.startswith("https://"):
+        raise HTTPException(422, "url must be an https:// address")
+    if db.get(blocklists.DnsBlocklist, key) is not None:
+        raise HTTPException(409, "A list with this id exists")
+    row = blocklists.DnsBlocklist(id=key, name=str(body.get("name") or key)[:200], url=url[:500],
+                                  category=str(body.get("category") or "malware")[:40], description=str(body.get("description") or "")[:500],
+                                  enabled=bool(body.get("enabled", True)), refresh_hours=int(body.get("refreshHours") or 24))
+    db.add(row)
+    audit.record(db, principal.actor, "dns.blocklist.create", key, None, url=url, category=row.category)
+    db.commit()
+    return blocklists.view(row)
+
+
+@console.patch("/dns/blocklists/{key}")
+def update_blocklist(key: str, body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("platform")
+    row = _blocklist(db, key)
+    if "enabled" in body:
+        row.enabled = bool(body["enabled"])
+    if "refreshHours" in body:
+        row.refresh_hours = max(1, min(168, int(body["refreshHours"])))
+    if not row.builtin:
+        for field, attr in (("name", "name"), ("url", "url"), ("category", "category"), ("description", "description")):
+            if field in body:
+                if field == "url" and not str(body[field]).startswith("https://"):
+                    raise HTTPException(422, "url must be an https:// address")
+                setattr(row, attr, str(body[field])[:500])
+    audit.record(db, principal.actor, "dns.blocklist.update", key, None,
+                 **{k: body[k] for k in body if k in {"enabled", "refreshHours", "url", "category"}})
+    db.commit()
+    blocklists.CACHE.invalidate()
+    return blocklists.view(row)
+
+
+@console.post("/dns/blocklists/{key}/sync")
+def sync_blocklist(key: str, force: bool = False, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("platform")
+    row = _blocklist(db, key)
+    result = blocklists.fetch(db, row, force=force)
+    audit.record(db, principal.actor, "dns.blocklist.sync", key, None, **{k: v for k, v in result.items() if k != "id"})
+    db.commit()
+    return {**result, "list": blocklists.view(row)}
+
+
+@console.delete("/dns/blocklists/{key}")
+def delete_blocklist(key: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("platform")
+    row = _blocklist(db, key)
+    if row.builtin:
+        raise HTTPException(409, "Built-in lists can be disabled but not deleted")
+    db.delete(row)
+    audit.record(db, principal.actor, "dns.blocklist.delete", key, None)
+    db.commit()
+    blocklists.CACHE.invalidate()
+    return {"deleted": key}
+
+
+# --------------------------------------------------------------------------- threat intel
+
+
+@console.get("/intel/lookup")
+def intel_lookup(value: str, tenant_id: str | None = None, principal: Principal = Depends(current_principal),
+                 db: Session = Depends(get_db)):
+    tid = scoped_tenant(principal, tenant_id)[0] if tenant_id else principal.user.tenant_id
+    try:
+        result = intel.lookup(db, value, tid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # Where has this been seen in our own telemetry?
+    from ..models import Event
+    from sqlalchemy import cast, String
+
+    seen = db.execute(select(Event.device_id, func.count()).where(Event.tenant_id.in_(principal.tenant_ids),
+                                                                  cast(Event.fields, String).contains(result["indicator"]))
+                      .group_by(Event.device_id).limit(50)).all()
+    result["sightings"] = [{"deviceId": d, "events": c} for d, c in seen]
+    return result
+
+
+@console.get("/intel/indicators")
+def list_indicators(tenant_id: str | None = None, q: str | None = None, source: str | None = None, limit: int = 500,
+                    principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    scope = scoped_tenant(principal, tenant_id)
+    query = select(Indicator).where((Indicator.tenant_id.in_(scope)) | (Indicator.tenant_id.is_(None)))
+    if q:
+        query = query.where(Indicator.value.contains(q.lower()))
+    if source:
+        query = query.where(Indicator.source.like(f"{source}%"))
+    return {"stats": intel.stats(db), "items": [to_dict(i) for i in db.execute(query.order_by(Indicator.created_at.desc())
+                                                                               .limit(min(limit, 5000))).scalars()]}
+
+
+@console.post("/intel/indicators")
+def add_indicators(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Add one or many indicators. Accepts {values: [...]} or a newline-separated {text}."""
+    principal.require("configure")
+    tenant_id = body.get("tenantId")
+    principal.check_tenant(tenant_id)
+    verdict = str(body.get("verdict") or "malicious")
+    if verdict not in {"malicious", "suspicious", "allow"}:
+        raise HTTPException(400, "verdict must be malicious, suspicious or allow")
+    values = list(body.get("values") or []) + [line for line in str(body.get("text") or "").splitlines()]
+    added, rejected = 0, []
+    for value in values:
+        value = value.strip()
+        if not value or value.startswith("#"):
+            continue
+        try:
+            kind = intel.classify(value)
+        except ValueError as exc:
+            rejected.append(str(exc))
+            continue
+        intel.upsert(db, kind, value, verdict, str(body.get("category") or "malware"), str(body.get("source") or "manual"),
+                     tenant_id, int(body.get("confidence") or 80), str(body.get("description") or ""))
+        added += 1
+    audit.record(db, principal.actor, "intel.indicators.added", f"{added} indicators", tenant_id, verdict=verdict)
+    if added:  # phones' apps take the new verdicts straight away rather than at their next daily check
+        from .. import mobile_protection
+
+        db.flush()
+        mobile_protection.reassess(db, tenant_id)
+    db.commit()
+    dnsfilter.INTEL.invalidate()
+    return {"added": added, "rejected": rejected[:50]}
+
+
+@console.delete("/intel/indicators/{indicator_id}")
+def delete_indicator(indicator_id: int, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("configure")
+    row = db.get(Indicator, indicator_id)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    principal.check_tenant(row.tenant_id)
+    db.delete(row)
+    audit.record(db, principal.actor, "intel.indicator.deleted", row.value, row.tenant_id)
+    db.commit()
+    dnsfilter.INTEL.invalidate()
+    return {"ok": True}
+
+
+@console.post("/intel/sync")
+def intel_sync(principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("platform")
+    settings = get_settings()
+    try:
+        if not settings.feed_url:
+            raise HTTPException(400, "No signature feed is configured (set FENRIR_FEED_URL in deploy/.env).")
+        result = intel.sync_feed(db, settings.feed_url, settings.feed_token)
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Feed sync failed: {exc}") from exc
+    audit.record(db, principal.actor, "intel.feed.synced", settings.feed_url, None, **result)
+    db.commit()
+    return result
+
+
+@console.get("/intel/yara")
+def list_yara(principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    rows = db.execute(select(YaraRule).where((YaraRule.tenant_id.is_(None)) | (YaraRule.tenant_id.in_(principal.tenant_ids)))
+                      .order_by(YaraRule.name).limit(5000)).scalars().all()
+    return [to_dict(r) for r in rows]
+
+
+@console.post("/intel/yara")
+def add_yara(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("configure")
+    tenant_id = body.get("tenantId")
+    principal.check_tenant(tenant_id)
+    source = str(body.get("source") or "")
+    if "rule " not in source or "condition:" not in source:
+        raise HTTPException(400, "That does not look like a YARA rule (needs 'rule' and 'condition:')")
+    row = YaraRule(tenant_id=tenant_id, name=str(body.get("name") or "custom rule"), source=source, origin="custom")
+    db.add(row)
+    audit.record(db, principal.actor, "intel.yara.added", row.name, tenant_id)
+    db.commit()
+    return to_dict(row)
+
+
+@console.get("/ml/model")
+def ml_model_info(principal: Principal = Depends(current_principal)):
+    from .. import mlmodel
+
+    bundle = mlmodel.current()
+    if bundle is None:
+        return {"available": False}
+    return {"available": True, "version": bundle.version, "sha256": bundle.sha256, "size": bundle.size, "metrics": bundle.metrics}
+
+
+@console.post("/ml/score")
+async def ml_score(request: Request, principal: Principal = Depends(current_principal)):
+    """Score an uploaded file (raw request body, max 64 MB) with the static model. Nothing is stored."""
+    from .. import mlmodel
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "Send the file as the request body")
+    if len(data) > 64 * 1024 * 1024:
+        raise HTTPException(413, "File larger than 64 MB")
+    return mlmodel.score_bytes(data)
+
+
+# --------------------------------------------------------------------------- vulnerabilities
+
+
+@console.get("/vulnerabilities")
+def list_vulnerabilities(tenant_id: str | None = None, status: str | None = "open", severity: str | None = None,
+                         principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    query = select(Vulnerability).where(Vulnerability.tenant_id.in_(scoped_tenant(principal, tenant_id)))
+    if status:
+        query = query.where(Vulnerability.status == status)
+    if severity:
+        query = query.where(Vulnerability.severity == severity)
+    rows = db.execute(query.order_by(Vulnerability.known_exploited.desc(), Vulnerability.cvss.desc().nullslast())
+                      .limit(5000)).scalars().all()
+    devices = {d.id: d for d in db.execute(select(Device).where(Device.id.in_({v.device_id for v in rows}))).scalars()}
+    now = utcnow()
+    by_cve: dict[str, dict] = {}
+    for v in rows:
+        device = devices.get(v.device_id)
+        criticality = (device.criticality if device else None) or "medium"
+        elevated = vulnmgmt.device_elevated(device)
+        risk = vulnmgmt.risk_score(v, criticality, elevated)
+        entry = by_cve.setdefault(v.vuln_id, {"vulnId": v.vuln_id, "severity": v.severity, "cvss": v.cvss,
+                                              "knownExploited": v.known_exploited, "summary": v.summary, "packages": set(),
+                                              "fixedVersion": v.fixed_version, "devices": [], "riskScore": 0.0,
+                                              "recommendation": vulnmgmt.recommendation(v), "overdue": 0,
+                                              "epss": v.epss, "cvssVector": v.cvss_vector, "fix": v.fix or {}, "sources": set(),
+                                              "priority": "P4"})
+        device_priority = vulnmgmt.priority(v, elevated)
+        entry["priority"] = min(entry["priority"], device_priority)  # "P1" < "P4"
+        entry["packages"].add(v.package)
+        entry["sources"].add(v.source)
+        if v.epss is not None and (entry["epss"] is None or v.epss > entry["epss"]):
+            entry["epss"] = v.epss
+        entry["riskScore"] = max(entry["riskScore"], risk)
+        overdue = bool(v.due_at and v.due_at < now and v.status in {"open", "patching"})
+        entry["overdue"] += int(overdue)
+        entry["devices"].append({"deviceId": v.device_id, "hostname": device.hostname if device else "", "installed": v.installed_version,
+                                 "package": v.package, "evidence": v.evidence or {}, "fix": v.fix or {}, "platform": device.platform if device else "",
+                                 "id": v.id, "status": v.status, "criticality": criticality, "riskScore": risk,
+                                 "priority": device_priority, "exposure": (device.exposure_flags or []) if device else [],
+                                 "remediation": v.remediation,
+                                 "assignee": v.assignee or "", "ticketId": v.ticket_id, "overdue": overdue,
+                                 "dueAt": v.due_at.isoformat(timespec="seconds") + "Z" if v.due_at else None,
+                                 "verifiedAt": v.verified_at.isoformat(timespec="seconds") + "Z" if v.verified_at else None,
+                                 "exception": {"reason": v.exception_reason, "approvedBy": v.exception_approved_by,
+                                               "expiresAt": v.exception_expires_at.isoformat(timespec="seconds") + "Z"}
+                                 if v.status == "accepted" else None})
+    out = sorted(by_cve.values(), key=lambda e: (-e["riskScore"], -len(e["devices"])))
+    for entry in out:
+        entry["packages"] = sorted(entry["packages"])
+        entry["sources"] = sorted(entry["sources"])
+    return out
+
+
+@console.get("/vulnerabilities/cve/{cve_id}")
+def cve_detail(cve_id: str, tenant_id: str | None = None, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Everything about one CVE: NVD/EPSS/KEV intelligence and every device in scope it affects, with evidence and fix."""
+    from .. import cveintel
+    from ..models import CveRecord
+
+    rows = db.execute(select(Vulnerability).where(Vulnerability.vuln_id == cve_id,
+                                                  Vulnerability.tenant_id.in_(scoped_tenant(principal, tenant_id)))).scalars().all()
+    intel = cveintel.record_view(db.get(CveRecord, cve_id))
+    if not rows and intel is None:
+        raise HTTPException(404, "Not found")
+    devices = {d.id: d for d in db.execute(select(Device).where(Device.id.in_({v.device_id for v in rows}))).scalars()}
+    affected = []
+    for v in sorted(rows, key=lambda r: (r.status == "fixed", r.device_id)):
+        device = devices.get(v.device_id)
+        affected.append({**to_dict(v), "hostname": device.hostname if device else "", "platform": device.platform if device else "",
+                         "riskScore": vulnmgmt.risk_score(v, device.criticality if device else None, vulnmgmt.device_elevated(device)),
+                         "priority": vulnmgmt.priority(v, vulnmgmt.device_elevated(device)),
+                         "reasons": vulnmgmt.risk_reasons(v, device), "recommendation": vulnmgmt.recommendation(v)})
+    return {"cve": cve_id, "intel": intel, "affected": affected}
+
+
+@console.get("/vulnerabilities/trends")
+def vulnerability_trends(tenant_id: str | None = None, weeks: int = Query(default=12, ge=1, le=52),
+                         principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Open vulnerabilities at the end of each week (by severity), plus found/fixed counts per week."""
+    scope = scoped_tenant(principal, tenant_id)
+    rows = db.execute(select(Vulnerability.severity, Vulnerability.first_seen, Vulnerability.verified_at, Vulnerability.status,
+                             Vulnerability.known_exploited).where(Vulnerability.tenant_id.in_(scope))).all()
+    now = utcnow()
+    out = []
+    for week in range(weeks - 1, -1, -1):
+        end = now - timedelta(weeks=week)
+        start = end - timedelta(weeks=1)
+        open_rows = [r for r in rows if r.first_seen <= end and (r.verified_at is None or r.verified_at > end)]
+        out.append({"weekEnding": end.date().isoformat(),
+                    "open": Counter(r.severity for r in open_rows),
+                    "knownExploited": sum(1 for r in open_rows if r.known_exploited),
+                    "found": sum(1 for r in rows if start < r.first_seen <= end),
+                    "fixed": sum(1 for r in rows if r.verified_at and start < r.verified_at <= end)})
+    for entry in out:
+        entry["open"] = {sev: entry["open"].get(sev, 0) for sev in ("critical", "high", "medium", "low")}
+    return out
+
+
+@console.post("/vulnerabilities/ticket")
+def vulnerability_ticket(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Open one remediation ticket for a CVE across a customer's affected devices (or the given rows)."""
+    principal.require("respond")
+    query = select(Vulnerability).where(Vulnerability.status.in_(("open", "patching", "mitigated")))
+    if body.get("ids"):
+        query = query.where(Vulnerability.id.in_([int(i) for i in body["ids"]]))
+    elif body.get("vulnId") and body.get("tenantId"):
+        principal.check_tenant(body["tenantId"])
+        query = query.where(Vulnerability.vuln_id == body["vulnId"], Vulnerability.tenant_id == body["tenantId"])
+    else:
+        raise HTTPException(400, "Give ids, or vulnId and tenantId")
+    rows = [r for r in db.execute(query).scalars().all() if r.tenant_id in principal.tenant_ids]
+    if not rows:
+        raise HTTPException(404, "No open vulnerabilities matched")
+    if len({r.tenant_id for r in rows}) > 1 or len({r.vuln_id for r in rows}) > 1:
+        raise HTTPException(400, "A remediation ticket covers one vulnerability for one customer")
+    ticket = vulnmgmt.open_remediation_ticket(db, rows, principal.actor)
+    if ticket is None:
+        raise HTTPException(409, "Remediation tickets are part of the PSA, which this server does not run")
+    db.commit()
+    return {"ticketId": ticket.id, "number": ticket.number, "linked": len(rows)}
+
+
+@console.patch("/vulnerabilities/{vuln_pk}")
+def update_vulnerability(vuln_pk: int, body: dict = Body(...), principal: Principal = Depends(current_principal),
+                         db: Session = Depends(get_db)):
+    principal.require("respond")
+    row = db.get(Vulnerability, vuln_pk)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    principal.check_tenant(row.tenant_id)
+    if "assignee" in body:
+        row.assignee = str(body.get("assignee") or "")[:200] or None
+        audit.record(db, principal.actor, "vulnerability.assigned", f"{row.vuln_id}@{row.device_id}", row.tenant_id, assignee=row.assignee)
+    if "status" in body:
+        if body["status"] == "accepted":
+            principal.require("configure")  # accepting risk is a management decision
+        expires = None
+        if body.get("expiresAt"):
+            from datetime import datetime
+
+            try:
+                expires = datetime.fromisoformat(str(body["expiresAt"]).replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError as exc:
+                raise HTTPException(400, "expiresAt must be an ISO date") from exc
+        try:
+            vulnmgmt.set_status(db, row, body["status"], principal.actor, reason=str(body.get("reason") or ""), expires_at=expires)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    db.commit()
+    return to_dict(row)
+
+
+def _scan_devices_job(device_ids: list[str]) -> None:
+    db = session_factory()()
+    try:
+        for device_id in device_ids:
+            device = db.get(Device, device_id)
+            if device is not None:
+                try:
+                    exposure.scan_device(db, device)
+                    db.commit()
+                except httpx.HTTPError as exc:  # pragma: no cover - network dependent
+                    db.rollback()
+                    services.log.warning("vulnerability scan of %s failed: %s", device_id, exc)
+    finally:
+        db.close()
+
+
+@console.post("/vulnerabilities/scan")
+def scan_vulnerabilities(background: BackgroundTasks, body: dict = Body(default={}), principal: Principal = Depends(current_principal),
+                         db: Session = Depends(get_db)):
+    principal.require("respond")
+    scope = scoped_tenant(principal, body.get("tenantId"))
+    query = select(Device.id).where(Device.tenant_id.in_(scope))
+    if body.get("deviceId"):
+        query = query.where(Device.id == body["deviceId"])
+    ids = [row[0] for row in db.execute(query).all()]
+    background.add_task(_scan_devices_job, ids)
+    return {"queued": len(ids)}
+
+
+# --------------------------------------------------------------------------- attack surface
+
+
+@console.get("/exposure/assets")
+def list_assets(tenant_id: str | None = None, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    rows = db.execute(select(ExternalAsset).where(ExternalAsset.tenant_id.in_(scoped_tenant(principal, tenant_id)))).scalars().all()
+    return [to_dict(r) for r in rows]
+
+
+@console.post("/exposure/assets")
+def add_asset(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    principal.require("configure")
+    tenant_id = body.get("tenantId")
+    principal.check_tenant(tenant_id)
+    if body.get("ownershipConfirmed") is not True:
+        raise HTTPException(400, "Confirm you own or are authorised to scan this asset (ownershipConfirmed: true)")
+    target = str(body.get("target") or "").strip().lower()
+    if not target or "/" in target or " " in target:
+        raise HTTPException(400, "target must be a single hostname or IP address")
+    row = ExternalAsset(tenant_id=tenant_id, target=target, label=str(body.get("label") or ""), ownership_attested_by=principal.actor)
+    db.add(row)
+    audit.record(db, principal.actor, "exposure.asset.added", target, tenant_id, attested=True)
+    db.commit()
+    return to_dict(row)
+
+
+@console.delete("/exposure/assets/{asset_id}")
+def delete_asset(asset_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Stop scanning an address (for example, the customer no longer owns it)."""
+    principal.require("configure")
+    asset = db.get(ExternalAsset, asset_id)
+    if asset is None:
+        raise HTTPException(404, "Not found")
+    principal.check_tenant(asset.tenant_id)
+    db.delete(asset)
+    audit.record(db, principal.actor, "exposure.asset.removed", asset.target, asset.tenant_id)
+    db.commit()
+    return {"ok": True}
+
+
+def _scan_asset_job(asset_id: str) -> None:
+    db = session_factory()()
+    try:
+        asset = db.get(ExternalAsset, asset_id)
+        if asset is None:
+            return
+        asset.last_result = exposure.scan_external(asset)
+        asset.last_scan_at = utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+@console.post("/exposure/assets/{asset_id}/scan")
+def scan_asset(asset_id: str, background: BackgroundTasks, principal: Principal = Depends(current_principal),
+               db: Session = Depends(get_db)):
+    principal.require("respond")
+    asset = db.get(ExternalAsset, asset_id)
+    if asset is None:
+        raise HTTPException(404, "Not found")
+    principal.check_tenant(asset.tenant_id)
+    background.add_task(_scan_asset_job, asset.id)
+    audit.record(db, principal.actor, "exposure.asset.scanned", asset.target, asset.tenant_id)
+    db.commit()
+    return {"queued": True}
+
+
+# --------------------------------------------------------------------------- compliance
+
+
+@console.get("/compliance")
+def compliance_report(tenant_id: str | None = None, framework: str | None = None,
+                      principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    tid = tenant_id or principal.user.tenant_id
+    principal.check_tenant(tid)
+    tenant = db.get(Tenant, tid)
+    return {"tenant": tenant.name, "frameworks": compliance.evaluate(db, tenant, framework)}
+
+
+def _scoped_vulnerability(db: Session, principal: Principal, vuln_id: int) -> Vulnerability:
+    vuln = db.get(Vulnerability, vuln_id)
+    if vuln is None or vuln.tenant_id not in principal.tenant_ids:
+        raise HTTPException(404, "Not found")
+    return vuln
+
+
+@console.get("/vulnerabilities/{vuln_id}/remediation")
+def remediation_plan(vuln_id: int, mode: str = "update", principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """What a silent update (or uninstall) would do for this vulnerability on its device, without doing it."""
+    from .. import remediation
+
+    principal.require("read")
+    vuln = _scoped_vulnerability(db, principal, vuln_id)
+    try:
+        the_plan = remediation.plan(db, vuln, mode)
+    except remediation.RemediationError as exc:
+        return {"available": False, "reason": str(exc), "last": vuln.remediation}
+    return {"available": True, "mode": the_plan.mode, "commandType": the_plan.command_type, "description": the_plan.description,
+            "destructive": the_plan.destructive, "last": vuln.remediation}
+
+
+@console.post("/vulnerabilities/{vuln_id}/remediate")
+def remediate_vulnerability(vuln_id: int, request: Request, body: dict = Body(default={}), principal: Principal = Depends(current_principal),
+                            db: Session = Depends(get_db)):
+    """Silently patch (mode=update) or uninstall (mode=uninstall) through the agent's own package commands."""
+    from .. import approvals, remediation
+
+    mode = str(body.get("mode") or "update")
+    principal.require("destructive" if mode == "uninstall" else "scripts")
+    vuln = _scoped_vulnerability(db, principal, vuln_id)
+    if mode == "uninstall":  # CORE-15: optional second-person approval for removing software
+        device = db.get(Device, vuln.device_id)
+        approvals.gate(db, principal, "vulnerability.uninstall", f"Uninstall {vuln.package} on {device.hostname if device else vuln.device_id}",
+                       {"vulnerabilityId": vuln.id, **body}, [device] if device else [], destructive=True,
+                       route=f"vulnerabilities/{vuln.id}/remediate")
+    try:
+        command = remediation.execute(db, vuln, principal.actor, mode)
+    except remediation.RemediationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.commit()
+    return {"status": "queued", "commandId": command.id, "vulnerabilityId": vuln.id, "remediation": vuln.remediation}
+
+
+@console.post("/vulnerabilities/{vuln_id}/cyber-heal")
+def cyber_heal(vuln_id: int, request: Request, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The original Cyber Heal entry point: a silent update through remediation.py."""
+    return remediate_vulnerability(vuln_id, request, {"mode": "update"}, principal, db)
+
+
+@console.get("/vulnerabilities/auto-remediation")
+def get_auto_remediation(tenant_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    from .. import remediation
+
+    principal.check_tenant(tenant_id)
+    tenant = db.get(Tenant, tenant_id)
+    settings = remediation.auto_settings(tenant)
+    return {"settings": settings, "candidates": len(remediation.candidates(db, tenant, {**settings, "enabled": True})) if tenant else 0}
+
+
+@console.put("/vulnerabilities/auto-remediation")
+def set_auto_remediation(body: dict = Body(...), principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Per-customer silent automatic updates for the priorities named (never uninstalls)."""
+    from .. import remediation
+
+    principal.require("configure")
+    principal.require("scripts")
+    tenant_id = str(body.get("tenantId") or "")
+    principal.check_tenant(tenant_id)
+    tenant = db.get(Tenant, tenant_id)
+    if tenant is None:
+        raise HTTPException(404, "Not found")
+    priorities = [p for p in (body["priorities"] if "priorities" in body else ["P1"]) or [] if p in vulnmgmt.PRIORITIES]
+    if not priorities:
+        raise HTTPException(422, "Choose at least one priority")
+    settings = {"enabled": bool(body.get("enabled")), "priorities": priorities,
+                "minEpss": max(0.0, min(float(body.get("minEpss") or 0.0), 1.0)),
+                "maxPerRun": max(1, min(int(body.get("maxPerRun") or 25), 200)),
+                "requireApproval": bool(body.get("requireApproval"))}
+    tenant.settings = {**(tenant.settings or {}), "autoRemediation": settings}
+    audit.record(db, principal.actor, "vulnerability.auto_remediation.updated", tenant.name, tenant.id, **settings)
+    db.commit()
+    return {"settings": remediation.auto_settings(tenant)}

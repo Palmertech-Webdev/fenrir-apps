@@ -1,0 +1,387 @@
+"""Authenticated, one-time, OS-specific endpoint deployment artifacts.
+
+Do not publish these files through /downloads: every generated file contains a
+customer enrollment secret. They are returned only by an authenticated POST.
+"""
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import json
+import os
+import re
+import shlex
+import struct
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+
+from fastapi import HTTPException
+
+DOWNLOADS = Path(__file__).resolve().parents[1] / "downloads"
+MAX_SETUP_BYTES = 180 * 1024 * 1024
+
+
+def server_address(value: str) -> str:
+    value = value.rstrip("/")
+    parsed = urlparse(value)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise HTTPException(503, "Configure FENRIR_PUBLIC_URL as a public HTTPS origin (no path or credentials).")
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1")):
+        raise HTTPException(503, "Agent enrollment requires a public HTTPS server URL.")
+    if not parsed.netloc or not parsed.hostname or not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname):
+        raise HTTPException(503, "FENRIR_PUBLIC_URL must contain a valid DNS hostname or IPv4 address.")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(503, "FENRIR_PUBLIC_URL contains an invalid port.") from None
+    if port is not None and not (1 <= port <= 65535):
+        raise HTTPException(503, "FENRIR_PUBLIC_URL contains an invalid port.")
+    return value
+
+
+# Release manifests signed off the server (mounted read-only from deploy/releases); preferred over the image's own.
+SIGNED_RELEASES = Path(__file__).resolve().parents[1] / "releases"
+
+
+def signed_release_file(name: str) -> Path | None:
+    return release_file(name, SIGNED_RELEASES) or release_file(name)
+
+
+def release_file(name: str, root_dir: Path | None = None) -> Path | None:
+    """Only serve pre-staged local artifacts, never arbitrary user paths/symlinks."""
+    root = (root_dir or DOWNLOADS).resolve()
+    candidate = root / name
+    if candidate.is_symlink() or not candidate.is_file():
+        return None
+    resolved = candidate.resolve()
+    if root not in resolved.parents:
+        return None
+    return resolved
+
+
+def windows_release_mode() -> tuple[str | None, str]:
+    """Validate the automatically compiled, immutable image payload."""
+    executable = release_file("windows/FenrirSetup.exe")
+    manifest = release_file("windows/build.json")
+    if not executable or not manifest or executable.stat().st_size > MAX_SETUP_BYTES:
+        return None, "Windows components are missing. Rebuild the cloud Docker image; no manual staging is required."
+    try:
+        metadata = json.loads(manifest.read_text())
+        expected = metadata["sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, "Windows build manifest is invalid; rebuild the cloud image."
+    if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected) or _digest(executable) != expected:
+        return None, "Windows components failed SHA-256 verification; rebuild the cloud image."
+    return ("signed" if isinstance(metadata, dict) and metadata.get("signed") else "unsigned-hobby"), ""
+
+
+def _windows_warning(mode: str | None) -> str:
+    if mode == "unsigned-hobby":
+        return "Unsigned hobby build: user-mode testing only; no signed Windows kernel driver or full antivirus protection."
+    if mode == "signed":
+        sig = windows_signature()
+        text = (f"Signed by {sig['signer'] or 'your code-signing certificate'}. If that certificate is self-signed, Windows "
+                "trusts it only after the certificate (download below) is installed on each device under Trusted "
+                "Publishers and Trusted Root Certification Authorities, for example by Group Policy or Intune.")
+        if not sig["timestamped"]:
+            text += " The build has no timestamp, so its signature stops being valid when the certificate expires."
+        return text
+    return ""
+
+
+def available() -> dict:
+    linux = all(release_file(f"fenrir-agent-linux-{arch}") for arch in ("amd64", "arm64"))
+    macos = all(release_file(f"fenrir-agent-darwin-{arch}") for arch in ("amd64", "arm64"))
+    windows_mode, windows_reason = windows_release_mode()
+    return {
+        "linux": {"ready": linux, "extension": ".sh", "reason": "" if linux else "Linux x64 and ARM64 agent binaries must be built in the cloud image."},
+        "windows": {"ready": windows_mode is not None, "extension": ".exe",
+                    "mode": windows_mode or "unavailable", "reason": windows_reason,
+                    "warning": _windows_warning(windows_mode),
+                    "signature": windows_signature(),
+                    "certificateUrl": "/downloads/fenrir-codesign.cer" if windows_mode == "signed" else ""},
+        "macos": {"ready": macos, "extension": ".sh",
+                  "reason": "" if macos else "macOS Intel and Apple Silicon agent binaries must be built in the cloud image.",
+                  "warning": ("Unsigned build installed as a LaunchDaemon. Allow the agent Full Disk Access for complete "
+                              "scanning, and Screen Recording plus Accessibility for remote control." if macos else "")},
+    }
+
+
+def _check_token(token: str) -> str:
+    if not re.fullmatch(r"fet_[A-Za-z0-9_-]{16,120}", token):
+        raise HTTPException(500, "Unexpected enrollment token format.")
+    return token
+
+
+def _digest(file: Path) -> str:
+    checksum = hashlib.sha256()
+    with file.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(block)
+    return checksum.hexdigest()
+
+
+# Shared by the Linux and macOS installers: an optional web proxy for networks that require one. A repair install keeps
+# the proxy already configured unless --proxy is given; --proxy none removes it. Only the agent's own traffic uses it.
+PROXY_ARGS = """proxy=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --proxy) [ $# -ge 2 ] || { echo "--proxy needs a URL, for example --proxy http://proxy.example:3128" >&2; exit 2; }
+             proxy="$2"; shift 2 ;;
+    --proxy=*) proxy="${1#*=}"; shift ;;
+    *) echo "Unknown option: $1 (the only option is --proxy URL)" >&2; exit 2 ;;
+  esac
+done
+case "$proxy" in
+  ""|none|http://*|https://*) ;;
+  *) echo "--proxy must look like http://host:port (or none to remove a configured proxy)" >&2; exit 2 ;;
+esac
+case "$proxy" in *[!A-Za-z0-9:/._@%-]*) echo "--proxy contains characters a proxy address cannot have" >&2; exit 2 ;; esac"""
+
+
+def _linux_script(base: str, token: str) -> bytes:
+    bins = {arch: release_file(f"fenrir-agent-linux-{arch}") for arch in ("amd64", "arm64")}
+    if not all(bins.values()):
+        raise HTTPException(409, "Linux agent binaries are not available; rebuild the cloud image.")
+    digests = {arch: _digest(path) for arch, path in bins.items()}
+    # File is sensitive: the operator must download it from the authenticated UI
+    # and store /etc/fenrir/agent.env with root-only permissions.
+    script = f"""#!/bin/sh
+# Fenrir Linux customer installer. Treat this file as a secret until enrollment completes.
+set -eu
+if [ "$(id -u)" -ne 0 ]; then echo "Run this installer with sudo." >&2; exit 1; fi
+for tool in base64 gzip sha256sum install systemctl mktemp; do
+  command -v "$tool" >/dev/null 2>&1 || {{ echo "Missing dependency: $tool" >&2; exit 1; }}
+done
+[ -d /run/systemd/system ] || {{ echo "systemd is required for a persistent installation." >&2; exit 1; }}
+{PROXY_ARGS}
+if [ -z "$proxy" ] && [ -f /etc/fenrir/agent.env ]; then
+  proxy="$(sed -n 's/^HTTPS_PROXY=//p' /etc/fenrir/agent.env | tail -1)"
+fi
+[ "$proxy" = none ] && proxy=""
+case "$(uname -m)" in
+  x86_64|amd64) arch=amd64; expected={digests['amd64']} ;;
+  aarch64|arm64) arch=arm64; expected={digests['arm64']} ;;
+  *) echo "Unsupported Linux architecture." >&2; exit 1 ;;
+esac
+base={shlex.quote(base)}
+token={shlex.quote(token)}
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+# Both architectures are embedded; installation never fetches mutable binaries.
+case "$arch" in
+  amd64) base64 -d <<'FENRIR_AMD64_PAYLOAD' | gzip -d > "$tmp/fenrir-agent"
+{base64.encodebytes(gzip.compress(bins['amd64'].read_bytes(), mtime=0)).decode().rstrip()}
+FENRIR_AMD64_PAYLOAD
+    ;;
+  arm64) base64 -d <<'FENRIR_ARM64_PAYLOAD' | gzip -d > "$tmp/fenrir-agent"
+{base64.encodebytes(gzip.compress(bins['arm64'].read_bytes(), mtime=0)).decode().rstrip()}
+FENRIR_ARM64_PAYLOAD
+    ;;
+esac
+printf '%s  %s\\n' "$expected" "$tmp/fenrir-agent" | sha256sum --check --status || {{
+  echo "Agent binary SHA-256 mismatch; refusing installation." >&2; exit 1;
+}}
+# Do not erase an existing device identity or runtime database on a repair.
+install -d -m 0700 /etc/fenrir /var/lib/fenrir
+install -m 0755 "$tmp/fenrir-agent" /usr/local/bin/fenrir-agent.new
+mv -f /usr/local/bin/fenrir-agent.new /usr/local/bin/fenrir-agent
+umask 077
+cat > /etc/fenrir/agent.env <<EOF
+FENRIR_SERVER=$base
+FENRIR_ENROLLMENT_TOKEN=$token
+FENRIR_STATE_DIR=/var/lib/fenrir
+EOF
+if [ -n "$proxy" ]; then
+  printf 'HTTPS_PROXY=%s\\nHTTP_PROXY=%s\\nNO_PROXY=localhost,127.0.0.1,::1\\n' "$proxy" "$proxy" >> /etc/fenrir/agent.env
+fi
+chmod 600 /etc/fenrir/agent.env
+cat > /etc/systemd/system/fenrir-agent.service <<'EOF'
+[Unit]
+Description=Fenrir managed endpoint agent
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+EnvironmentFile=/etc/fenrir/agent.env
+ExecStart=/usr/local/bin/fenrir-agent
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 644 /etc/systemd/system/fenrir-agent.service
+systemctl daemon-reload
+systemctl enable fenrir-agent
+systemctl restart fenrir-agent
+sleep 2
+if ! systemctl is-active --quiet fenrir-agent; then
+  echo "Agent service failed; inspect journalctl -u fenrir-agent." >&2; exit 1
+fi
+echo "Fenrir agent installed as an automatic-start service. Confirm the device checks in to your tenant."
+"""
+    return script.encode("utf-8")
+
+
+def _macos_script(base: str, token: str) -> bytes:
+    bins = {arch: release_file(f"fenrir-agent-darwin-{arch}") for arch in ("amd64", "arm64")}
+    if not all(bins.values()):
+        raise HTTPException(409, "macOS agent binaries are not available; rebuild the cloud image.")
+    digests = {arch: _digest(path) for arch, path in bins.items()}
+    payloads = {arch: base64.encodebytes(gzip.compress(path.read_bytes(), mtime=0)).decode().rstrip()
+                for arch, path in bins.items()}
+    script = f"""#!/bin/sh
+# Fenrir macOS customer installer. Treat this file as a secret until enrollment completes.
+set -eu
+if [ "$(id -u)" -ne 0 ]; then echo "Run this installer with sudo." >&2; exit 1; fi
+{PROXY_ARGS}
+plist=/Library/LaunchDaemons/com.fenrir.agent.plist
+if [ -z "$proxy" ] && [ -f "$plist" ]; then
+  proxy="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:HTTPS_PROXY' "$plist" 2>/dev/null || true)"
+fi
+[ "$proxy" = none ] && proxy=""
+proxy_env=""
+if [ -n "$proxy" ]; then
+  proxy_env="<key>HTTPS_PROXY</key><string>$proxy</string><key>HTTP_PROXY</key><string>$proxy</string><key>NO_PROXY</key><string>localhost,127.0.0.1,::1</string>"
+fi
+case "$(uname -m)" in
+  x86_64) arch=amd64; expected={digests['amd64']} ;;
+  arm64) arch=arm64; expected={digests['arm64']} ;;
+  *) echo "Unsupported macOS architecture." >&2; exit 1 ;;
+esac
+base={shlex.quote(base)}
+token={shlex.quote(token)}
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+case "$arch" in
+  amd64) /usr/bin/base64 -D <<'FENRIR_AMD64_PAYLOAD' | /usr/bin/gzip -d > "$tmp/fenrir-agent"
+{payloads['amd64']}
+FENRIR_AMD64_PAYLOAD
+    ;;
+  arm64) /usr/bin/base64 -D <<'FENRIR_ARM64_PAYLOAD' | /usr/bin/gzip -d > "$tmp/fenrir-agent"
+{payloads['arm64']}
+FENRIR_ARM64_PAYLOAD
+    ;;
+esac
+printf '%s  %s\\n' "$expected" "$tmp/fenrir-agent" | /usr/bin/shasum -a 256 -c -s || {{
+  echo "Agent binary SHA-256 mismatch; refusing installation." >&2; exit 1;
+}}
+/bin/mkdir -p /usr/local/bin /var/db/fenrir
+/bin/chmod 700 /var/db/fenrir
+/usr/bin/install -m 0755 "$tmp/fenrir-agent" /usr/local/bin/fenrir-agent.new
+/bin/mv -f /usr/local/bin/fenrir-agent.new /usr/local/bin/fenrir-agent
+/usr/bin/xattr -d com.apple.quarantine /usr/local/bin/fenrir-agent 2>/dev/null || true
+umask 077
+cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fenrir.agent</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/fenrir-agent</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FENRIR_SERVER</key><string>$base</string>
+    <key>FENRIR_ENROLLMENT_TOKEN</key><string>$token</string>
+    <key>FENRIR_STATE_DIR</key><string>/var/db/fenrir</string>
+    $proxy_env
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/var/log/fenrir-agent.log</string>
+  <key>StandardErrorPath</key><string>/var/log/fenrir-agent.log</string>
+</dict>
+</plist>
+EOF
+/usr/sbin/chown root:wheel "$plist"
+/bin/chmod 600 "$plist"
+/bin/launchctl bootout system/com.fenrir.agent 2>/dev/null || true
+/bin/launchctl bootstrap system "$plist"
+/bin/launchctl enable system/com.fenrir.agent
+/bin/launchctl kickstart -k system/com.fenrir.agent
+echo "Fenrir agent installed as a LaunchDaemon. Confirm the device checks in to your tenant."
+echo "In System Settings > Privacy & Security, allow /usr/local/bin/fenrir-agent under:"
+echo "  - Full Disk Access (complete scanning)"
+echo "  - Screen Recording and Accessibility (remote screen view and control)"
+"""
+    return script.encode("utf-8")
+
+
+WINDOWS_CONFIG_MAGIC = b"FENRIR_ENROLL_V1!"
+
+
+def attach_windows_overlay(executable: bytes, overlay: bytes) -> bytes:
+    """Attach the per-customer enrolment overlay without breaking an Authenticode signature.
+
+    Unsigned files get it appended. Signed files get it inside the signature's certificate table (the same place
+    Chrome puts its download tags): Windows does not hash that table, so the signature stays valid, and the
+    overlay still ends the file where setup reads it.
+    """
+    if len(executable) < 0x40 or executable[:2] != b"MZ":
+        return executable + overlay  # not a PE (test stubs): nothing to keep valid
+    pe = struct.unpack_from("<I", executable, 0x3C)[0]
+    if pe + 24 + 112 + 40 > len(executable) or executable[pe:pe + 4] != b"PE\0\0":
+        return executable + overlay
+    optional = pe + 24
+    magic = struct.unpack_from("<H", executable, optional)[0]
+    directories = optional + (96 if magic == 0x10B else 112)  # PE32 / PE32+
+    security = directories + 4 * 8  # IMAGE_DIRECTORY_ENTRY_SECURITY
+    table_offset, table_size = struct.unpack_from("<II", executable, security)
+    if table_size == 0:
+        return executable + overlay
+    if table_offset + table_size != len(executable):
+        raise ValueError("the signature is not at the end of the file")
+    padding = (-len(overlay)) % 8  # the certificate table stays 8-byte aligned
+    extra = b"\0" * padding + overlay
+    data = bytearray(executable + extra)
+    struct.pack_into("<I", data, security + 4, table_size + len(extra))
+    first_length = struct.unpack_from("<I", data, table_offset)[0]  # WIN_CERTIFICATE.dwLength of the only entry
+    if first_length != table_size:
+        raise ValueError("unexpected certificate table layout")
+    struct.pack_into("<I", data, table_offset, first_length + len(extra))
+    return bytes(data)
+
+
+def windows_signature() -> dict:
+    """Whether the image's Windows build is code-signed, from its build manifest."""
+    manifest = release_file("windows/build.json")
+    try:
+        meta = json.loads(manifest.read_text()) if manifest else {}
+    except (OSError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return {"signed": bool(meta.get("signed")), "signer": str(meta.get("signer") or ""),
+            "thumbprint": str(meta.get("signerSha1") or ""), "timestamped": bool(meta.get("timestamped"))}
+
+
+def _windows_executable(base: str, token: str) -> tuple[bytes, str, str]:
+    mode, problem = windows_release_mode()
+    if mode is None:
+        raise HTTPException(409, problem)
+    executable = release_file("windows/FenrirSetup.exe")
+    # A small overlay is read by native setup before its UAC elevation. All agent
+    # components are already embedded as PE resources in the shared template.
+    # No shell, compiler, temporary customer files or public download URL needed.
+    request_id = uuid.uuid4().hex
+    payload = (base + "\n" + token + "\n" + request_id).encode("ascii")
+    if len(payload) > 4096:
+        raise HTTPException(422, "Installer enrollment configuration is too large.")
+    data = attach_windows_overlay(executable.read_bytes(), payload + struct.pack("<I", len(payload)) + WINDOWS_CONFIG_MAGIC)
+    return data, f"FenrirSetup-{request_id}.exe", "application/vnd.microsoft.portable-executable"
+
+
+def build(os_name: str, base: str, token: str) -> tuple[bytes, str, str]:
+    """Return (body, filename, MIME). Artifact checks must run before DB token creation."""
+    base = server_address(base)
+    token = _check_token(token)
+    if os_name == "linux":
+        return _linux_script(base, token), "Install-Fenrir-Linux.sh", "text/x-shellscript"
+    if os_name == "windows":
+        return _windows_executable(base, token)
+    if os_name == "macos":
+        return _macos_script(base, token), "Install-Fenrir-macOS.sh", "text/x-shellscript"
+    raise HTTPException(409, "The selected operating system does not have an installable agent release yet.")

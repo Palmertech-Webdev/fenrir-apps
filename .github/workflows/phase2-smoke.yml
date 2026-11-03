@@ -1,0 +1,411 @@
+name: Phase 2 Full-Stack Smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  cloud-regressions:
+    name: Cloud API and Phase 2 regressions (SQLite + PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fenrir
+          POSTGRES_PASSWORD: fenrir
+          POSTGRES_DB: fenrir
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fenrir" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install tests
+        run: pip install -r cloud/requirements-dev.txt "psycopg[binary]>=3.2"
+      - name: Verify legacy device upgrades and readiness on PostgreSQL first
+        working-directory: cloud
+        env:
+          FENRIR_TEST_DATABASE_URL: postgresql+psycopg://fenrir:fenrir@localhost:5432/fenrir
+        run: python -m pytest -q tests/test_migrations.py tests/test_production_mode.py
+      - name: Verify UK governance catalogue and historical assessments first
+        working-directory: cloud
+        run: python -m pytest -q tests/test_grc_programme.py tests/test_grc_revisions.py tests/test_grc_uk_catalogue.py tests/test_platform.py
+      - name: Verify cancellation, retirement and existing command upgrades first
+        working-directory: cloud
+        run: python -m pytest -q tests/test_command_cancellation.py tests/test_phase2_operational_exit.py tests/test_device_decommission.py tests/test_device_lifecycle.py
+      - name: Verify cancellation on PostgreSQL
+        working-directory: cloud
+        env:
+          FENRIR_TEST_DATABASE_URL: postgresql+psycopg://fenrir:fenrir@localhost:5432/fenrir
+        run: python -m pytest -q tests/test_command_cancellation.py tests/test_phase2_operational_exit.py
+      - name: Run all tests with SQLite
+        working-directory: cloud
+        run: python -m pytest -q
+
+  cloud-postgres:
+    # Every test builds and drops the whole schema, so the full PostgreSQL run takes over 20 minutes on one runner.
+    # Four parallel shards, each with its own database, keep it well inside the timeout.
+    name: Cloud API on real PostgreSQL (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fenrir
+          POSTGRES_PASSWORD: fenrir
+          POSTGRES_DB: fenrir
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fenrir" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install tests
+        run: pip install -r cloud/requirements-dev.txt "psycopg[binary]>=3.2"
+      - name: Run this shard of all tests with real PostgreSQL
+        working-directory: cloud
+        env:
+          FENRIR_TEST_DATABASE_URL: postgresql+psycopg://fenrir:fenrir@localhost:5432/fenrir
+          FENRIR_TEST_SHARD: ${{ matrix.shard }}/4
+        run: python -m pytest -q
+
+  console-regressions:
+    name: Console TypeScript build and array-contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install isolated console test API
+        run: python -m pip install -r cloud/requirements-dev.txt
+      - name: Compile and test the console
+        working-directory: console
+        env:
+          FENRIR_UI_TEST_LEGACY: "true"
+        run: npm ci --no-audit --no-fund && npm run build && npm run test:shapes && npm run test:remote && npm run test:pages
+
+  linux-agent-regressions:
+    name: Linux agent Go tests and both native architectures
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: agent/linux/go.sum
+      - name: Run Go vet, tests, amd64 and arm64 builds
+        run: make -C agent/linux test agent agent-arm64
+
+  unsigned-windows-agent:
+    name: Windows native service and unsigned hobby installer (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Windows user-mode build
+        shell: pwsh
+        run: cmake -B build -S agent/windows/service -DANTIVIRUS_REQUIRE_MINIFILTER_PAYLOAD=OFF
+      - name: Test remote SAS, bounded pipe I/O and WinGet operation safety
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target fenrir-remote-sas-tests fenrir-remote-pipe-tests fenrir-winget-tests fenrir-cancellation-tests fenrir-rmm-tests fenrir-tempadmin-tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/fenrir-remote-sas-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/fenrir-remote-pipe-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/fenrir-winget-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/fenrir-cancellation-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/fenrir-rmm-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/fenrir-tempadmin-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File agent/windows/tests/SystemProfileShapeTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File agent/windows/tests/ActiveDirectorySnapshotTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File agent/windows/tests/ActiveDirectoryOpsTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File agent/windows/tests/PatchScriptSyntaxTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows native installer and bundled service
+        shell: pwsh
+        run: cmake --build build --config Release --target antivirus-setup
+      - name: Signature rules need every marker of a ransomware chain (no BlackCat verdict on browsers)
+        shell: pwsh
+        run: powershell.exe -NoProfile -File agent/windows/tests/SignatureRuleMatchTests.ps1
+      - name: Clean-software false-positive suite (installed signed software on the runner)
+        shell: pwsh
+        timeout-minutes: 16
+        run: powershell.exe -NoProfile -File agent/windows/tests/CleanSoftwareFalsePositiveTests.ps1
+      - name: Verify unsigned binaries and their trusted build digests
+        shell: pwsh
+        run: |
+          foreach ($file in @('agent/windows/out/dev/fenrir-agent-service.exe', 'agent/windows/out/install/FenrirSetup.exe')) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing Windows build output: $file" }
+            Get-FileHash -Algorithm SHA256 -LiteralPath $file
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Phase2-Windows-UNSIGNED-VM-CANDIDATE
+          path: |
+            agent/windows/out/install/FenrirSetup.exe
+            agent/windows/out/dev/fenrir-agent-service.exe
+          if-no-files-found: error
+
+  isolated-docker-smoke:
+    name: Docker, PostgreSQL and served console
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate isolated one-run deployment secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p deploy/releases
+          {
+            printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 20)"
+            printf 'FENRIR_SECRET_KEY=%s\n' "$(openssl rand -hex 32)"
+            printf 'FENRIR_VAULT_KEY=%s\n' "$(openssl rand -base64 32 | tr -d '\n')"
+            printf 'FENRIR_ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)"
+            printf 'FENRIR_PUBLIC_URL=http://127.0.0.1:8080\n'
+            printf 'FENRIR_OPEN_ENROLLMENT=false\n'
+            printf 'FENRIR_FEED_SYNC=false\n'
+            printf 'FENRIR_ALLOW_UNSIGNED_WINDOWS_INSTALLERS=false\n'
+            printf 'FENRIR_REQUIRE_MFA=false\n'
+          } > deploy/.env
+          # Throwaway agent release key for this run only (deploy/signing is git-ignored; Compose only reads build
+          # secrets from inside the project, which is where auto-update.sh keeps the real key too).
+          mkdir -p deploy/signing
+          openssl genpkey -algorithm ed25519 -out deploy/signing/release-ed25519.pem
+          echo "FENRIR_RELEASE_KEY=$PWD/deploy/signing/release-ed25519.pem" >> "$GITHUB_ENV"
+          echo "FENRIR_RELEASE_SEQ=$(git log -1 --format=%ct -- agent/linux)" >> "$GITHUB_ENV"
+      - name: Production profile refuses to build without a signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e deploy/signing/codesign.pfx   # CI never has private signing material
+          : > /tmp/empty
+          set +e
+          FENRIR_BUILD_PROFILE=production CODESIGN_PFX=/tmp/empty CODESIGN_PASSWORD_FILE=/tmp/empty SIGN_OUT=/tmp/sig sh deploy/sign-windows.sh 2>/tmp/sign.err
+          code=$?
+          set -e
+          test "$code" -eq 3 && grep -q "production build profile needs a Windows code-signing certificate" /tmp/sign.err
+          FENRIR_BUILD_PROFILE=lab CODESIGN_PFX=/tmp/empty CODESIGN_PASSWORD_FILE=/tmp/empty SIGN_OUT=/tmp/sig sh deploy/sign-windows.sh
+          grep -q '"profile": "lab"' /tmp/sig/signing.json
+          echo "PASS: production refuses unsigned; lab builds unsigned and says so"
+      - name: Validate the documented HTTPS and local-only Compose profiles
+        shell: bash
+        env:
+          FENRIR_DOMAIN: fenrir.test
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.https.example.yml --env-file deploy/.env config --format json > /tmp/fenrir-https.json
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml -f deploy/docker-compose.local.yml --env-file deploy/.env config --format json > /tmp/fenrir-local.json
+          python - <<'PY'
+          import json
+          for name in ('https', 'local'):
+              config = json.load(open(f'/tmp/fenrir-{name}.json'))
+              ports = config['services']['cloud']['ports']
+              assert len(ports) == 1 and ports[0]['host_ip'] == '127.0.0.1', ports
+          secure = json.load(open('/tmp/fenrir-https.json'))
+          assert {str(p['published']) for p in secure['services']['caddy']['ports']} == {'80', '443'}
+          print('HTTPS and local evaluation profiles keep the API port on loopback.')
+          PY
+      - name: Reproduce a checkout updated under umask 077
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Git keeps the executable bit, not checkout read permissions. A
+          # private backup umask must not make the non-root image unreadable.
+          find cloud ml/fenrir_ml ml/models -type f -exec chmod go-rwx {} +
+          find cloud ml/fenrir_ml ml/models -type d -exec chmod 700 {} +
+      - name: Build the actual Docker image and start PostgreSQL + cloud
+        shell: bash
+        env:
+          # Keep the throwaway release key outside the checkout. Use Compose's
+          # BuildKit path; Bake requires a separate filesystem entitlement for
+          # that runner-temp secret before it will start any image build.
+          COMPOSE_BAKE: "false"
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env up -d --build --wait --wait-timeout 300
+      - name: Real HTTP and Python module smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 8 --retry-delay 3 --retry-connrefused http://127.0.0.1:8080/health
+          curl --fail --silent --show-error http://127.0.0.1:8080/ready
+          # The API runs as FENRIR_ROLE=web; the worker container's scheduler and maintenance passes make this 200.
+          curl --fail --silent --show-error --retry 20 --retry-delay 6 --retry-all-errors http://127.0.0.1:8080/health/background
+          curl --fail --silent --show-error http://127.0.0.1:8080/ -o /tmp/fenrir-ui.html
+          grep -Eiq '<title>|id="root"' /tmp/fenrir-ui.html
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env exec -T cloud python -c 'import ast,pathlib; files=list(pathlib.Path("/app/cloud/fenrir_cloud").rglob("*.py")); [ast.parse(p.read_text(),filename=str(p)) for p in files]; print("PASS:",len(files),"Python modules parsed without writing to read-only runtime")'
+      - name: Validate the packaged agents inside the image, not just the build exit code
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env exec -T cloud python - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path("/app/cloud/downloads")
+          win = root / "windows"
+          meta = json.loads((win / "build.json").read_text())
+          setup = (win / "FenrirSetup.exe").read_bytes()
+          assert meta["mode"] == "unsigned-lab" and meta["profile"] == "lab" and meta["signed"] is False, meta
+          assert hashlib.sha256(setup).hexdigest() == meta["sha256"], "installer hash does not match build.json"
+          assert setup[:2] == b"MZ" and len(setup) > 1_000_000, "installer is not a plausible PE executable"
+          pe = int.from_bytes(setup[0x3C:0x40], "little")
+          assert setup[pe:pe + 4] == b"PE\0\0" and setup[pe + 4:pe + 6] == b"\x64\x86", "installer is not x64 PE"
+          linux = json.loads((root / "linux-build.json").read_text())
+          for arch, digest in linux["sha256"].items():
+              data = (root / f"fenrir-agent-linux-{arch}").read_bytes()
+              assert data[:4] == b"\x7fELF" and hashlib.sha256(data).hexdigest() == digest, arch
+          for arch, digest in linux["darwinSha256"].items():
+              data = (root / f"fenrir-agent-darwin-{arch}").read_bytes()
+              assert data[:4] in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe") and hashlib.sha256(data).hexdigest() == digest, arch
+          assert linux["releaseSigned"] is True and linux["pinnedReleaseKeys"] == 1, linux
+          for platform, prefix in (("linux", "linux"), ("macos", "darwin")):
+              for arch in ("amd64", "arm64"):
+                  manifest = json.loads((root / f"{platform}-{arch}.manifest.json").read_text())
+                  data = (root / f"fenrir-agent-{prefix}-{arch}").read_bytes()
+                  assert manifest["platform"] == platform and manifest["arch"] == arch and manifest["release"] == linux["release"], manifest
+                  assert manifest["sha256"] == hashlib.sha256(data).hexdigest() and manifest["size"] == len(data), (platform, arch)
+          print("PASS: unsigned-lab Windows installer and Linux/macOS agents match their build metadata and signed manifests")
+          PY
+          # Signatures checked independently of Fenrir's code, with OpenSSL and the run's public key.
+          openssl pkey -in "$FENRIR_RELEASE_KEY" -pubout -out /tmp/release-pub.pem
+          pub=$(openssl pkey -in "$FENRIR_RELEASE_KEY" -pubout -outform DER | tail -c 32 | base64)
+          for m in linux-amd64 linux-arm64 macos-amd64 macos-arm64; do
+            docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env exec -T cloud cat "/app/cloud/downloads/$m.manifest.json" > "/tmp/$m.json"
+            docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env exec -T cloud cat "/app/cloud/downloads/$m.manifest.sig" | base64 -d > "/tmp/$m.sig"
+            openssl pkeyutl -verify -pubin -inkey /tmp/release-pub.pem -rawin -in "/tmp/$m.json" -sigfile "/tmp/$m.sig"
+          done
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env exec -T cloud grep -c "$pub" /app/cloud/downloads/fenrir-agent-linux-amd64
+          echo "PASS: agent release manifests verify with OpenSSL and the release key is pinned in the agent"
+      - name: Verify complete monitoring-to-ticket-to-RMM outcome using real HTTP/PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source deploy/.env
+          set +a
+          python3 scripts/phase2_cloud_smoke.py
+      - name: Load test, 300 simulated agents on PostgreSQL with the separate worker (CORE-13)
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source deploy/.env
+          set +a
+          python3 scripts/loadtest/fenrir_load.py --server http://127.0.0.1:8080 --email admin@fenrir.local \
+            --password "$FENRIR_ADMIN_PASSWORD" --devices 300 --minutes 3 --events-per-minute 60 --out /tmp/load-300
+          cat /tmp/load-300/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Platform backup and full restore drill (AT-24)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export FENRIR_COMPOSE_FILES="$PWD/deploy/docker-compose.lab.yml"
+          c() { docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env "$@"; }
+          count() { c exec -T db psql -U fenrir -d fenrir -tAc "SELECT (SELECT count(*) FROM devices) || ',' || (SELECT count(*) FROM psa_tickets) || ',' || (SELECT count(*) FROM audit_log) || ',' || (SELECT count(*) FROM commands)" | tr -d '[:space:]'; }
+          before="$(count)"
+          deploy/backup.sh /tmp/fenrir-backups
+          backup="$(ls -d /tmp/fenrir-backups/fenrir-backup-* | tail -1)"
+          # Lose data: delete tickets and devices behind the application's back.
+          c exec -T db psql -U fenrir -d fenrir -v ON_ERROR_STOP=1 -c "TRUNCATE psa_tickets, devices CASCADE" >/dev/null
+          test "$(count)" != "$before"
+          # A damaged backup is refused before anything is touched.
+          cp -r "$backup" /tmp/damaged && printf 'x' >> /tmp/damaged/db.dump
+          if deploy/restore.sh /tmp/damaged --yes; then echo "a damaged backup was accepted"; exit 1; fi
+          deploy/restore.sh "$backup" --yes
+          after="$(count)"
+          echo "before=$before after=$after"
+          test "$after" = "$before"
+          curl --fail --silent --show-error http://127.0.0.1:8080/ready
+          echo "PASS: backup restored devices, tickets, commands and the audit chain; secrets decrypt"
+      - name: Go-live preflight against the running stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The CI stack is a lab (plain HTTP, no code-signing certificate), so preflight must report it as not ready;
+          # every check it can pass here must pass, and it must never print a secret.
+          status=0
+          FENRIR_COMPOSE_FILES="$PWD/deploy/docker-compose.lab.yml" FENRIR_BACKUP_DIR=/tmp/fenrir-backups NO_COLOR=1 \
+            deploy/preflight.sh --url http://127.0.0.1:8080 > /tmp/preflight.txt || status=$?
+          cat /tmp/preflight.txt
+          { echo '### Go-live preflight (lab stack)'; echo '```'; cat /tmp/preflight.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          test "$status" = 1 || { echo "preflight exited $status, expected 1"; exit 1; }
+          for expected in \
+            "PASS  .env is readable by its owner only" \
+            "PASS  The four secrets are all different" \
+            "PASS  Release signing key present, Ed25519, owner-only" \
+            "PASS  Containers running: db cloud worker" \
+            "PASS  A backup from the last two days" \
+            "PASS  /ready: database up and schema current" \
+            "PASS  /health/background" \
+            "FAIL  FENRIR_PUBLIC_URL (http://127.0.0.1:8080) is not HTTPS" \
+            "FAIL  No Windows code-signing certificate"; do
+            grep -qF "$expected" /tmp/preflight.txt || { echo "missing: $expected"; exit 1; }
+          done
+          for name in POSTGRES_PASSWORD FENRIR_SECRET_KEY FENRIR_VAULT_KEY FENRIR_ADMIN_PASSWORD; do
+            value="$(sed -n "s/^$name=//p" deploy/.env)"
+            if grep -qF "$value" /tmp/preflight.txt; then echo "preflight printed $name"; exit 1; fi
+          done
+          echo "PASS: preflight checked the live stack and printed no secrets"
+      - name: Restore into a brand-new server and measure the recovery time (AT-24)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export FENRIR_COMPOSE_FILES="$PWD/deploy/docker-compose.lab.yml"
+          c() { docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env "$@"; }
+          count() { c exec -T db psql -U fenrir -d fenrir -tAc "SELECT (SELECT count(*) FROM devices) || ',' || (SELECT count(*) FROM psa_tickets) || ',' || (SELECT count(*) FROM audit_log WHERE actor <> 'system:health-watch') || ',' || (SELECT count(*) FROM commands)" | tr -d '[:space:]'; }
+          before="$(count)"
+          deploy/backup.sh /tmp/fenrir-fresh
+          backup="$(ls -d /tmp/fenrir-fresh/fenrir-backup-* | tail -1)"
+          # Lose the whole server: containers, database and artifact volumes. Only the backup, .env and signing remain.
+          c down -v --remove-orphans
+          started=$(date +%s)
+          c up -d --wait --wait-timeout 300
+          deploy/restore.sh "$backup" --yes
+          curl --fail --silent --show-error --retry 20 --retry-delay 3 --retry-all-errors http://127.0.0.1:8080/health/background > /dev/null
+          rto=$(( $(date +%s) - started ))
+          after="$(count)"
+          echo "before=$before after=$after recovery=${rto}s"
+          test "$after" = "$before"
+          echo "### Fresh-server restore: ${rto} s from empty server to background jobs healthy (counts $after)" >> "$GITHUB_STEP_SUMMARY"
+          echo "PASS: a brand-new server restored from backup in ${rto} s with identical devices, tickets, audit entries and commands"
+      - name: Diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env ps || true
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env logs --tail=100 db cloud || true
+      - name: Always remove the test database and ephemeral volumes
+        if: always()
+        shell: bash
+        run: |
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env down -v --remove-orphans || true
+          rm -f deploy/.env
