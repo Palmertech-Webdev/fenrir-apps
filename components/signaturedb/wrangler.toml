@@ -1,0 +1,40 @@
+name = 'signaturedb-fenrir'
+main = "src/worker.ts"
+compatibility_date = "2026-04-23"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+preview_urls = false
+
+# Your own feed domain (a zone in your Cloudflare account):
+# routes = [
+#   { pattern = "feed.example.com", zone_name = "example.com", custom_domain = true }
+# ]
+
+[vars]
+FENRIR_FEED_MAX_HASHES = "20000"
+FENRIR_FEED_MAX_URLS = "10000"
+FENRIR_FEED_MAX_RULES = "2000"
+
+[[d1_databases]]
+binding = "fenrir"
+database_name = "apifenrir"
+database_id = "YOUR_D1_DATABASE_ID"  # wrangler d1 create apifenrir
+migrations_dir = "migrations/d1"
+
+[triggers]
+crons = ["*/30 * * * *"]
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1

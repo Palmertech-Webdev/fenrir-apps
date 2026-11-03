@@ -1,0 +1,100 @@
+name: Fenrir Platform
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "claude/**", "fix/**", "feat/**"]
+  pull_request:
+
+jobs:
+  cloud:
+    name: Fenrir Cloud (Python)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: fenrir, POSTGRES_PASSWORD: fenrir, POSTGRES_DB: fenrir }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install -r cloud/requirements-dev.txt "psycopg[binary]>=3.2"
+      - name: Tests (SQLite)
+        working-directory: cloud
+        run: python -m pytest -q
+      - name: Tests (PostgreSQL, a quarter of them; phase2-smoke.yml runs all four shards)
+        working-directory: cloud
+        env: { FENRIR_TEST_DATABASE_URL: "postgresql+psycopg://fenrir:fenrir@localhost:5432/fenrir", FENRIR_TEST_SHARD: "1/4" }
+        run: python -m pytest -q
+
+  console:
+    name: Fenrir Console (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: python -m pip install -r cloud/requirements-dev.txt
+      - working-directory: console
+        run: npm install --no-audit --no-fund && npm run build && npm run test:shapes && npm run test:remote && npm run test:pages
+      - run: node agent/windows/tests/EndpointUpdateUiTests.mjs
+
+  linux-agent:
+    name: Linux agent (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - run: make -C agent/linux test agent agent-arm64
+      - run: packaging/linux/build-deb.sh 1.0.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fenrir-linux-agent
+          path: dist/
+
+  ml:
+    name: ML model parity (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install -r ml/requirements.txt pytest
+      - working-directory: ml
+        run: python -m pytest -q
+
+  windows-agent:
+    name: Windows agent (MinGW cross-build + portable tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 g++ cmake
+      - name: Portable C++ unit tests (native)
+        working-directory: agent/windows
+        run: |
+          g++ -std=c++20 -Iservice/include service/src/BehaviorRules.cpp tests/BehaviorRulesTests.cpp -o /tmp/brtest && /tmp/brtest
+          g++ -std=c++20 -Iservice/include service/src/ExtendedPolicy.cpp service/src/BehaviorRules.cpp service/src/DeviceControl.cpp tests/PolicyAndDeviceControlTests.cpp -o /tmp/pdtest && /tmp/pdtest tests
+          g++ -std=c++20 -Iservice/include tests/EnrollmentPersistenceTests.cpp -o /tmp/enrollmenttest && /tmp/enrollmenttest
+          g++ -std=c++20 -Iservice/include tests/RemoteSasRequestTests.cpp -o /tmp/sastest && /tmp/sastest
+          g++ -std=c++20 -Iservice/include tests/WingetSupportTests.cpp -o /tmp/wingettest && /tmp/wingettest
+          g++ -std=c++20 -Iservice/include service/src/AdEventRules.cpp tests/AdMonitorTests.cpp -o /tmp/adtest && /tmp/adtest
+          g++ -std=c++20 -O2 -Iservice/include service/src/MlStaticModel.cpp tools/mltestcli/src/MlTestCliMain.cpp -o /tmp/mltest
+          /tmp/mltest score ../../ml/models/fenrir-pe-v1.fgbt ../../ml/testdata/hello64.exe
+      - name: Cross-compile service and scanner
+        run: |
+          agent/windows/cmake/make-mingw-header-shims.sh /tmp/shims
+          cmake -B /tmp/winbuild -S agent/windows/service -DCMAKE_TOOLCHAIN_FILE=$PWD/agent/windows/cmake/mingw-w64-x86_64.cmake -DCMAKE_BUILD_TYPE=Release -DANTIVIRUS_REQUIRE_MINIFILTER_PAYLOAD=OFF -DCMAKE_CXX_FLAGS=-I/tmp/shims -DCMAKE_C_FLAGS=-I/tmp/shims
+          cmake --build /tmp/winbuild -j4 --target antivirus-agent-service fenrir-remote antivirus-scannercli fenrir-mltest fenrir-behavior-tests fenrir-policy-tests fenrir-rmm-tests fenrir-tempadmin-tests
+
+  image:
+    name: Platform image
+    runs-on: ubuntu-latest
+    needs: [cloud, console, linux-agent, ml, windows-agent]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/Dockerfile -t fenrir-cloud:${{ github.sha }} .

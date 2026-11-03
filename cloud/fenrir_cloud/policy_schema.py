@@ -1,0 +1,1083 @@
+"""The protection policy schema, templates, layering, and agent translation.
+
+Every setting is declared once in ``SCHEMA``. From that single declaration we
+derive the defaults, input validation, the console's policy editor, and the
+flattened document each agent receives.
+
+Layering (most general first):
+
+    template defaults -> global policy -> tenant policy -> group policy chain -> device override
+
+Each layer stores only the keys it changes. A layer can also *lock* a dotted
+key, after which lower layers cannot override it (ESET calls this "force").
+"""
+
+from __future__ import annotations
+
+import copy
+import ipaddress
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Field declarations
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class F:
+    key: str
+    kind: str  # bool | int | enum | list | str
+    default: Any
+    label: str
+    help: str = ""
+    min: int | None = None
+    max: int | None = None
+    options: tuple[str, ...] = ()
+    platforms: tuple[str, ...] = ("windows", "linux", "macos")
+
+
+@dataclass(frozen=True)
+class Section:
+    key: str
+    title: str
+    description: str
+    fields: tuple[F, ...] = field(default_factory=tuple)
+
+
+ASR_RULES = (
+    ("blockOfficeChildProcesses", "Block Office apps from creating child processes"),
+    ("blockOfficeExecutableContent", "Block Office apps from writing executable content"),
+    ("blockOfficeCodeInjection", "Block Office apps from injecting code into other processes"),
+    ("blockObfuscatedScripts", "Block potentially obfuscated scripts"),
+    ("blockScriptDownloadedPayloads", "Block JavaScript/VBScript launching downloaded executables"),
+    ("blockEmailExecutables", "Block executable content from email and webmail"),
+    ("blockCredentialStealingLsass", "Block credential stealing from LSASS"),
+    ("blockPsexecWmiProcessCreation", "Block process creation from PsExec and WMI commands"),
+    ("blockUntrustedUsbProcesses", "Block untrusted and unsigned processes that run from USB"),
+    ("blockWmiPersistence", "Block persistence through WMI event subscription"),
+    ("blockVulnerableSignedDrivers", "Block abuse of exploited vulnerable signed drivers"),
+    ("blockLolbinAbuse", "Block living-off-the-land binary abuse (certutil, mshta, regsvr32, rundll32)"),
+    ("blockAdobeReaderChildProcesses", "Block Adobe Reader from creating child processes"),
+    ("blockWebshellCreation", "Block webshell creation on servers"),
+    ("advancedRansomwareProtection", "Use advanced protection against ransomware"),
+)
+
+DNS_CATEGORIES = (
+    "malware",
+    "phishing",
+    "command-and-control",
+    "cryptomining",
+    "newly-registered",
+    "parked",
+    "dga",
+    "adult",
+    "gambling",
+    "piracy",
+    "ads-trackers",
+    "social-media",
+    "streaming",
+    "games",
+    "dating",
+    "proxies-vpn",
+    "doh-bypass",
+)
+
+ASR_MODES = ("off", "audit", "warn", "block")
+
+SCHEMA: tuple[Section, ...] = (
+    Section(
+        "antimalware",
+        "Anti-malware engine",
+        "Signature, heuristic, machine-learning and cloud reputation scanning.",
+        (
+            F("realtimeProtection", "bool", True, "Real-time protection", "Scan files on open, write and execute."),
+            F("cloudLookup", "bool", True, "Cloud reputation lookups", "Ask Fenrir Cloud about unknown hashes and URLs."),
+            F("cloudLookupObserveOnly", "bool", False, "Cloud verdicts observe-only", "Log cloud verdicts without acting on them."),
+            F("scriptInspection", "bool", True, "Script and memory inspection (AMSI)", platforms=("windows",)),
+            F("quarantineOnMalicious", "bool", True, "Quarantine malicious files"),
+            F("mlSensitivity", "enum", "balanced", "Machine-learning sensitivity",
+              "Higher catches more unknown malware with more false positives.",
+              options=("off", "cautious", "balanced", "aggressive", "paranoid")),
+            F("puaProtection", "enum", "block", "Potentially unwanted apps", options=("off", "audit", "block")),
+            F("scanArchives", "bool", True, "Scan inside archives"),
+            F("archiveObserveOnly", "bool", False, "Archive detections observe-only"),
+            F("archiveMaxDepth", "int", 5, "Archive nesting depth", min=1, max=20),
+            F("scanRemovableMedia", "bool", True, "Scan removable media on insert"),
+            F("scanNetworkDrives", "bool", False, "Scan mapped network drives"),
+            F("scanMaliciousBlockThreshold", "int", 45, "On-demand block score", min=1, max=99),
+            F("scanMaliciousQuarantineThreshold", "int", 70, "On-demand quarantine score", min=1, max=99),
+            F("scanBenignDampeningScore", "int", 20, "Benign evidence dampening", min=0, max=80),
+            F("genericRuleScoreScalePercent", "int", 75, "Generic rule weight (%)", min=20, max=100),
+            F("realtimeExecuteBlockThreshold", "int", 55, "Real-time execute block score", min=40, max=99),
+            F("realtimeNonExecuteBlockThreshold", "int", 60, "Real-time open/write block score", min=50, max=99),
+            F("realtimeQuarantineThreshold", "int", 75, "Real-time quarantine score", min=40, max=99),
+            F("realtimeObserveTelemetryThreshold", "int", 35, "Telemetry-only score", min=1, max=95),
+            F("realtimeObserveOnlyForNonExecute", "bool", False, "Only observe non-execute access"),
+            F("enableCleanwareSignerDampening", "bool", True, "Trust known clean publishers"),
+            F("enableKnownGoodHashDampening", "bool", True, "Trust known-good hashes"),
+            F("quickScanSchedule", "str", "daily 12:30", "Quick scan schedule", "e.g. 'daily 12:30', 'weekdays 09:00', 'off'."),
+            F("fullScanSchedule", "str", "weekly sun 02:00", "Full scan schedule"),
+            F("scanCpuLimitPercent", "int", 50, "Scheduled scan CPU limit (%)", min=5, max=100),
+            F("exclusionPaths", "list", [], "Excluded paths", "Folder roots to skip. Prefer hashes or signers where possible."),
+            F("exclusionSha256", "list", [], "Excluded SHA-256 hashes"),
+            F("exclusionSigners", "list", [], "Excluded publishers (signer names)"),
+            F("exclusionProcesses", "list", [], "Excluded processes", "Files opened by these processes are not scanned."),
+            F("requireSignerForSuppression", "bool", False, "Path exclusions only for signed files"),
+            F("allowUnsignedSuppressionPathExecutables", "bool", False, "Allow unsigned executables in excluded paths"),
+        ),
+    ),
+    Section(
+        "edr",
+        "EDR and behaviour",
+        "Behavioural detection, process control, exploit and credential protection.",
+        (
+            F("enabled", "bool", True, "Behavioural monitoring"),
+            F("enforceProcessStartVerdicts", "bool", True, "Block malicious process starts"),
+            F("terminateProcessTreeOnExecuteBlock", "bool", True, "Kill the whole process tree on block"),
+            F("quarantineAfterProcessKill", "bool", True, "Quarantine the image after killing it"),
+            F("memoryScanning", "bool", True, "Advanced memory scanner", "Scan process memory after unpacking/injection."),
+            F("exploitProtection", "bool", True, "Exploit blocker", "Watch browsers, Office, PDF readers and Java for exploitation."),
+            F("credentialProtection", "bool", True, "Credential theft protection", "Protect LSASS and browser credential stores."),
+            F("deceptionLures", "bool", False, "Deception lures", "Plant fake credentials and files that alert on touch."),
+            F("telemetryLevel", "enum", "standard", "Telemetry level", options=("minimal", "standard", "verbose")),
+            F("collectProcessEvents", "bool", True, "Collect process events"),
+            F("collectNetworkEvents", "bool", True, "Collect network events"),
+            F("collectFileEvents", "bool", True, "Collect file events"),
+            F("collectRegistryEvents", "bool", True, "Collect registry events", platforms=("windows",)),
+            F("collectDnsEvents", "bool", True, "Collect DNS events"),
+            F("collectScriptEvents", "bool", True, "Collect script content (AMSI/PowerShell)", platforms=("windows",)),
+            F("telemetryUploadSeconds", "int", 30, "Telemetry upload interval (s)", min=5, max=3600),
+            F("failServiceStartupIfRealtimeCoverageMissing", "bool", True, "Fail closed if real-time coverage is missing", platforms=("windows",)),
+            F("requireMinifilterBrokerConnection", "bool", True, "Require the file-system minifilter",
+              "No effect yet: Fenrir does not ship its Windows kernel driver, so blocking before a program runs comes from "
+              "Microsoft Defender (see Protection health).", platforms=("windows",)),
+        ),
+    ),
+    Section(
+        "attackSurface",
+        "Attack surface reduction",
+        "Per-rule control of common initial-access and lateral-movement techniques.",
+        tuple(F(key, "enum", "block" if key not in {"blockPsexecWmiProcessCreation", "blockWebshellCreation"} else "audit",
+                label, options=ASR_MODES) for key, label in ASR_RULES),
+    ),
+    Section(
+        "defender",
+        "Microsoft Defender",
+        "Manage the Defender antivirus built into Windows alongside Fenrir. Defender blocks before a program runs; Fenrir's "
+        "EDR, machine learning and DNS filtering work on top of it.",
+        (
+            F("managed", "bool", False, "Manage Microsoft Defender",
+              "Fenrir sets the options below on every Windows device, re-applies them every six hours, and turns Defender's "
+              "detections into alerts.", platforms=("windows",)),
+            F("realTimeProtection", "bool", True, "Real-time protection", platforms=("windows",)),
+            F("cloudProtection", "enum", "high", "Cloud-delivered protection",
+              "How hard Defender's cloud blocks unknown files: default, high, high+ or zero tolerance.",
+              options=("off", "default", "high", "highPlus", "zeroTolerance"), platforms=("windows",)),
+            F("puaProtection", "enum", "block", "Potentially unwanted apps", options=("off", "audit", "block"), platforms=("windows",)),
+            F("networkProtection", "enum", "audit", "Network protection",
+              "Blocks connections to dangerous sites from any app, not only browsers.", options=("off", "audit", "block"),
+              platforms=("windows",)),
+            F("controlledFolderAccess", "enum", "off", "Controlled folder access",
+              "Only trusted apps may change files in protected folders.", options=("off", "audit", "block"), platforms=("windows",)),
+            F("enforceAttackSurfaceRules", "bool", True, "Enforce attack surface rules through Defender",
+              "Each rule under Attack surface reduction is also set in Defender, which stops it before the program runs. "
+              "Rules Defender has no equivalent for stay with Fenrir.", platforms=("windows",)),
+            F("exclusionPaths", "list", [], "Defender path exclusions", "Files and folders Defender should not scan.",
+              platforms=("windows",)),
+            F("exclusionProcesses", "list", [], "Defender process exclusions", platforms=("windows",)),
+            F("exclusionExtensions", "list", [], "Defender extension exclusions", platforms=("windows",)),
+            F("exclusionsAuthoritative", "bool", False, "Only Fenrir's exclusions",
+              "Remove every Defender exclusion that is not in this policy, including ones added on the device or by other "
+              "tools. Off: Fenrir removes only exclusions it added itself when they leave the policy.", platforms=("windows",)),
+            F("blockAtFirstSight", "bool", True, "Block at first sight",
+              "New files are checked with Defender's cloud before they can run.", platforms=("windows",)),
+            F("behaviorMonitoring", "bool", True, "Behaviour monitoring", platforms=("windows",)),
+            F("scriptScanning", "bool", True, "Script scanning (AMSI)", platforms=("windows",)),
+            F("downloadScanning", "bool", True, "Scan downloads and attachments", platforms=("windows",)),
+            F("archiveScanning", "bool", True, "Scan inside archives", platforms=("windows",)),
+            F("emailScanning", "bool", True, "Scan email files", platforms=("windows",)),
+            F("removableDriveScanning", "bool", True, "Scan USB drives during full scans", platforms=("windows",)),
+            F("sampleSubmission", "enum", "safe", "Sample submission",
+              "Which suspicious files Defender may send to Microsoft for analysis.", options=("safe", "all", "never"),
+              platforms=("windows",)),
+            F("threatAction", "enum", "quarantine", "Action on threats",
+              "What Defender does with threats of every severity.", options=("quarantine", "remove"), platforms=("windows",)),
+            F("quarantineRetentionDays", "int", 90, "Keep quarantined items (days)", min=1, max=365, platforms=("windows",)),
+            F("signatureUpdateHours", "int", 4, "Check for new definitions every (hours)", min=1, max=24, platforms=("windows",)),
+            F("quickScanDaily", "bool", True, "Set the daily quick scan time",
+              "Off: Defender keeps its own quick scan schedule.", platforms=("windows",)),
+            F("quickScanHour", "int", 12, "Daily quick scan at (hour, device time)", min=0, max=23, platforms=("windows",)),
+            F("fullScanDay", "enum", "off", "Weekly full scan", options=("off", "sunday", "monday", "tuesday", "wednesday",
+                                                                         "thursday", "friday", "saturday"), platforms=("windows",)),
+            F("fullScanHour", "int", 2, "Weekly full scan at (hour, device time)", min=0, max=23, platforms=("windows",)),
+            F("hideDefenderInterface", "bool", False, "Hide Defender's interface from users",
+              "Users cannot open Windows Security's virus protection pages or change anything there.", platforms=("windows",)),
+            F("controlledFolders", "list", [], "Extra folders for controlled folder access",
+              "Documents, Pictures and the other standard folders are always protected.", platforms=("windows",)),
+            F("controlledFolderApps", "list", [], "Apps allowed to change protected folders",
+              "Full paths of programs controlled folder access should trust.", platforms=("windows",)),
+            F("allowedThreats", "list", [], "Allowed threat IDs (false positives)",
+              "Defender threat IDs to allow, from a detection Fenrir shows. Use sparingly.", platforms=("windows",)),
+        ),
+    ),
+    Section(
+        "mobile",
+        "Phone app protection",
+        "Android phones check every installed app: where it came from, what it can do, and its fingerprint against threat "
+        "intelligence. New installs are checked as they happen.",
+        (
+            F("alertOn", "enum", "high", "Raise an alert for",
+              "malicious: only apps threat intelligence knows are bad; high: also apps that behave like banking trojans or "
+              "stalkerware; medium: also apps worth a look, such as sideloaded apps with risky abilities.",
+              options=("off", "malicious", "high", "medium"), platforms=("android",)),
+            F("suspendMalicious", "bool", False, "Suspend malicious apps on company-owned phones",
+              "On phones where Fenrir is the device owner, a malicious app is suspended at once (it cannot run until an "
+              "administrator lets it). Other phones ask the user to remove it.", platforms=("android",)),
+        ),
+    ),
+    Section(
+        "android",
+        "Android phones",
+        "Passcode, restrictions, apps and network for Android phones. A phone enrolled with a work profile (a personal "
+        "phone) has these enforced inside the work profile, and the passcode on the whole phone. A phone enrolled with "
+        "device admin only is checked against them: what is not met is reported as non-compliant and the user is asked to "
+        "fix it.",
+        (
+            # Passcode and security
+            F("passcodeComplexity", "enum", "none", "Phone passcode",
+              "none: not managed; low: any PIN or pattern; medium: a PIN of 4+ digits without repeats or a password; high: "
+              "a PIN of 8+ digits or a password of 6+ characters.", options=("none", "low", "medium", "high"), platforms=("android",)),
+            F("screenLockMinutes", "int", 0, "Lock the screen after (minutes)",
+              "Longest idle time before the phone locks. 0 leaves it to the user. Enforced with a work profile.",
+              min=0, max=60, platforms=("android",)),
+            F("wipeAfterFailedAttempts", "int", 0, "Erase work data after failed unlock attempts",
+              "With a work profile, this many wrong passcodes removes the work profile (personal data is untouched). 0 is off.",
+              min=0, max=30, platforms=("android",)),
+            F("requireEncryption", "bool", True, "Require storage encryption", "Reported as non-compliant when storage is not encrypted.",
+              platforms=("android",)),
+            F("blockDeveloperOptions", "bool", True, "No developer options or USB debugging",
+              "Blocked in a work profile; on other phones, developer options or USB debugging being on is non-compliant.",
+              platforms=("android",)),
+            F("minSecurityPatchDays", "int", 90, "Security patch no older than (days)",
+              "A phone whose Android security patch is older is non-compliant. 0 turns the check off.", min=0, max=730, platforms=("android",)),
+            F("minAndroidVersion", "int", 0, "Minimum Android version", "For example 13. 0 turns the check off.", min=0, max=30,
+              platforms=("android",)),
+            F("flagRooted", "bool", True, "Flag rooted phones", "A phone that looks rooted (an su binary, test-keys build) is non-compliant.",
+              platforms=("android",)),
+            # Restrictions (work profile)
+            F("disableCamera", "bool", False, "Block the camera in work apps", "Work profile only.", platforms=("android",)),
+            F("disableScreenCapture", "bool", False, "Block screenshots of work apps", "Work profile only.", platforms=("android",)),
+            F("blockUnknownSources", "bool", True, "Block installing apps from outside an app store",
+              "Blocked in a work profile; elsewhere, sideloaded apps are already reported by app protection.", platforms=("android",)),
+            F("blockCopyPasteToPersonal", "bool", True, "Block copying work data to personal apps", "Work profile only.",
+              platforms=("android",)),
+            F("blockAddingAccounts", "bool", False, "Block adding accounts in the work profile", "Work profile only.",
+              platforms=("android",)),
+            F("blockBluetoothSharing", "bool", False, "Block sharing work files over Bluetooth", "Work profile only.",
+              platforms=("android",)),
+            # Apps
+            F("requiredApps", "list", [], "Required apps",
+              "One per line: package name, or package|https URL of a company APK|SHA-256. With a work profile, company APKs install "
+              "silently and store apps are offered to the user; elsewhere a missing app is non-compliant and the user is asked to "
+              "install it.", platforms=("android",)),
+            F("blockedApps", "list", [], "Blocked apps",
+              "Package names. With a work profile they are hidden there; elsewhere having one installed is non-compliant and the user "
+              "is asked to remove it.", platforms=("android",)),
+            F("runtimePermissions", "enum", "prompt", "App permission requests in the work profile",
+              "prompt: the user decides; grant: grant automatically; deny: deny automatically.", options=("prompt", "grant", "deny"),
+              platforms=("android",)),
+            # Network
+            F("wifiNetworks", "list", [], "Wi-Fi networks",
+              "One per line: SSID|WPA2|password or SSID|WPA3|password or SSID|OPEN. Offered to the phone (Android asks the user "
+              "once). The password is stored in the policy, so use a network meant for staff devices.", platforms=("android",)),
+            F("alwaysOnVpnApp", "str", "", "Always-on VPN app",
+              "Package name of a VPN app to keep connected for work apps (work profile).", platforms=("android",)),
+            F("alertOnNonCompliance", "bool", True, "Raise an alert when a phone is not compliant",
+              "One alert per phone, listing what is not met; it closes itself when the phone is compliant again.", platforms=("android",)),
+        ),
+    ),
+    Section(
+        "ransomware",
+        "Ransomware protection",
+        "Behavioural encryption detection, protected folders, canaries and rollback.",
+        (
+            F("enabled", "bool", True, "Ransomware shield"),
+            F("mode", "enum", "block", "Response", options=("audit", "block", "block-and-rollback")),
+            F("massEncryptionFilesPerMinute", "int", 40, "Files changed per minute that trigger detection", min=5, max=1000),
+            F("entropyDetection", "bool", True, "High-entropy write detection"),
+            F("canaryFiles", "bool", True, "Canary (honey) files"),
+            F("blockShadowCopyDeletion", "bool", True, "Block shadow copy and backup deletion"),
+            F("protectedFolders", "list", ["%USERPROFILE%\\Documents", "%USERPROFILE%\\Desktop", "%USERPROFILE%\\Pictures"],
+              "Protected folders", "Only allowed apps may modify these folders."),
+            F("protectedFoldersMode", "enum", "audit", "Protected folder enforcement", options=("off", "audit", "block")),
+            F("allowedApps", "list", [], "Apps allowed into protected folders"),
+            F("rollbackSnapshots", "bool", True, "Keep rollback snapshots (VSS / btrfs / APFS)"),
+            F("snapshotIntervalHours", "int", 4, "Snapshot interval (hours)", min=1, max=72),
+            F("networkShareProtection", "bool", True, "Detect remote encryption over SMB"),
+        ),
+    ),
+    Section(
+        "web",
+        "Web and phishing protection",
+        "Destination reputation for browsers, email links and every process.",
+        (
+            F("destinationProtectionEnabled", "bool", True, "Destination reputation"),
+            F("antiPhishingEnabled", "bool", True, "Anti-phishing"),
+            F("webProtectionEnabled", "bool", True, "Web protection"),
+            F("emailLinkProtectionEnabled", "bool", True, "Email link protection"),
+            F("evaluateDomains", "bool", True, "Evaluate domains"),
+            F("evaluateUrls", "bool", True, "Evaluate full URLs"),
+            F("blockKnownMaliciousDestinations", "bool", True, "Block malicious destinations"),
+            F("blockKnownPhishingDestinations", "bool", True, "Block phishing destinations"),
+            F("blockKnownScamDestinations", "bool", False, "Block scam destinations"),
+            F("warnOnSuspiciousDestinations", "bool", True, "Warn on suspicious destinations"),
+            F("warnOnNewlyRegisteredDomains", "bool", True, "Warn on newly registered domains"),
+            F("networkObserveOnly", "bool", False, "Network verdicts observe-only"),
+            F("allowDegradedDestinationModeWhenOffline", "bool", True, "Fall back to local lists when offline"),
+            F("browserContextRequiredForWarnOnly", "bool", False, "Only warn inside browsers"),
+            F("suspiciousDestinationWarnThreshold", "int", 45, "Suspicious warn score", min=1, max=99),
+            F("phishingWarnThreshold", "int", 55, "Phishing warn score", min=1, max=99),
+            F("phishingBlockThreshold", "int", 80, "Phishing block score", min=1, max=99),
+            F("destinationCacheTtlMinutes", "int", 240, "Verdict cache (minutes)", min=5, max=10080),
+            F("bankingProtection", "bool", True, "Secure browser for banking and payments", platforms=("windows",)),
+        ),
+    ),
+    Section(
+        "dns",
+        "DNS protection",
+        "Encrypted DNS filtering through Fenrir Cloud, on and off the corporate network.",
+        (
+            F("enabled", "bool", True, "DNS filtering"),
+            F("mode", "enum", "agent-doh", "Delivery", "agent-doh routes the device's DNS through its own DoH URL.",
+              options=("agent-doh", "network-resolver", "observe")),
+            F("blockedCategories", "list", ["malware", "phishing", "command-and-control", "cryptomining", "dga", "doh-bypass"],
+              "Blocked categories", options=DNS_CATEGORIES),
+            F("blockAction", "enum", "sinkhole", "Block response", options=("sinkhole", "nxdomain", "refused")),
+            F("allowDomains", "list", [], "Always allow"),
+            F("blockDomains", "list", [], "Always block"),
+            F("safeSearch", "bool", False, "Enforce SafeSearch"),
+            F("blockThirdPartyDoh", "bool", True, "Block third-party encrypted DNS (DoH/DoT bypass)"),
+            F("logQueries", "enum", "blocked", "Query logging", options=("none", "blocked", "all")),
+            F("localProxy", "bool", False, "Local loopback DNS proxy",
+              "The agent answers DNS on a loopback address, forwards it to the device's DoH URL and caches verdicts, so "
+              "blocked domains stay blocked offline. The system resolver is pointed at it and restored when turned off."),
+            F("localProxyFailMode", "enum", "open", "When Fenrir Cloud is unreachable",
+              "open: resolve uncached names with the previous system resolver. closed: refuse them.", options=("open", "closed")),
+            F("sinkholeInterception", "bool", True, "Intercept connections to blocked domains",
+              "Blocked names resolve to a loopback sinkhole that records which process tried to connect (HTTP Host and TLS SNI) "
+              "and serves a block page over HTTP."),
+            F("localCacheMinutes", "int", 30, "Local verdict cache (minutes)", min=1, max=1440),
+        ),
+    ),
+    Section(
+        "firewall",
+        "Firewall and network attack protection",
+        "Host firewall, IDS signatures, and isolation behaviour.",
+        (
+            F("enabled", "bool", True, "Managed firewall"),
+            F("defaultInbound", "enum", "block", "Default inbound", options=("allow", "block")),
+            F("defaultOutbound", "enum", "allow", "Default outbound", options=("allow", "block")),
+            F("defaultsOnLinuxMac", "bool", False, "Apply default actions on Linux and macOS",
+              "Off: Linux and macOS only apply custom rules. Turn on after allowing the services a server offers "
+              "(SSH always stays open).", platforms=("linux", "macos")),
+            F("networkAttackProtection", "bool", True, "Network attack protection (IDS)"),
+            F("botnetProtection", "bool", True, "Botnet / C2 callback blocking"),
+            F("bruteForceProtection", "bool", True, "Block RDP/SMB/SSH brute force"),
+            F("blockSmbV1", "bool", True, "Block SMBv1", platforms=("windows",)),
+            F("blockLlmnrNetbios", "bool", True, "Block LLMNR and NetBIOS poisoning", platforms=("windows",)),
+            F("rules", "list", [], "Custom rules",
+              "One rule per line: allow|block in|out tcp|udp|any [ports] [from|to addresses], e.g. "
+              "'allow in tcp 3389 from 10.0.0.0/8'. Block rules win over allow rules."),
+            F("networkContainment", "bool", True, "Allow remote network isolation"),
+            F("isolationAllowlist", "list", [], "Reachable while isolated", "Hosts/CIDRs still reachable during isolation."),
+        ),
+    ),
+    Section(
+        "deviceControl",
+        "Device control",
+        "USB, Bluetooth, optical and printer access.",
+        (
+            F("enabled", "bool", True, "Device control"),
+            F("usbStorage", "enum", "allow", "USB storage", options=("allow", "audit", "read-only", "block")),
+            F("usbAllowedIds", "list", [], "Allowed USB device IDs", "VID:PID or serial."),
+            F("encryptedUsbOnly", "bool", False, "Only allow encrypted USB drives"),
+            F("bluetoothFileTransfer", "enum", "allow", "Bluetooth file transfer", options=("allow", "audit", "block")),
+            F("opticalMedia", "enum", "allow", "CD/DVD", options=("allow", "read-only", "block")),
+            F("mtpDevices", "enum", "allow", "Phones and cameras (MTP)", options=("allow", "read-only", "block")),
+            F("printing", "enum", "allow", "Printing", options=("allow", "audit", "block")),
+        ),
+    ),
+    Section(
+        "applicationControl",
+        "Application control",
+        "Allow/deny execution by publisher, hash, path or reputation.",
+        (
+            F("mode", "enum", "off", "Mode", options=("off", "audit", "enforce-denylist", "enforce-allowlist")),
+            F("blockedApps", "list", [], "Blocked apps", "Names, hashes or publisher names."),
+            F("allowedPublishers", "list", ["Microsoft Windows", "Microsoft Corporation"], "Trusted publishers"),
+            F("allowedHashes", "list", [], "Trusted hashes"),
+            F("blockUnknownReputation", "bool", False, "Block apps with no reputation"),
+            F("blockNewlySeenExecutables", "bool", False, "Block executables first seen in the last 24h"),
+        ),
+    ),
+    Section(
+        "privilege",
+        "Privilege management",
+        "Least-privilege controls with just-in-time elevation (PAM).",
+        (
+            F("enabled", "bool", False, "Privilege management"),
+            F("removeLocalAdmins", "bool", False, "Remove standing local admin rights"),
+            F("elevationRequests", "enum", "approval", "Elevation requests", options=("off", "auto-approve", "approval")),
+            F("elevationMinutes", "int", 30, "Elevation length (minutes)", min=5, max=480),
+            F("autoApprovePublishers", "list", [], "Auto-approve signed by"),
+            F("breakGlassAllowed", "bool", True, "Allow break-glass admin"),
+            F("rotateLocalAdminPassword", "bool", False, "Rotate the local admin password (LAPS)",
+              "The agent sets a random password for the local Administrator and stores it in the vault first. "
+              "Never runs on domain controllers.", platforms=("windows",)),
+            F("localAdminAccount", "str", "", "Local admin account to manage",
+              "Leave empty for the built-in Administrator (RID 500).", platforms=("windows",)),
+            F("localAdminPasswordDays", "int", 30, "Rotate every (days)", min=1, max=365, platforms=("windows",)),
+        ),
+    ),
+    Section(
+        "patch",
+        "Patch and vulnerability management",
+        "Operating system and third-party patching, prioritised by exploitability.",
+        (
+            F("enabled", "bool", True, "Patch management"),
+            F("autoApprove", "enum", "security", "Auto-approve", options=("none", "critical", "security", "all")),
+            F("thirdPartyApps", "bool", True, "Patch third-party apps"),
+            F("prioritiseKnownExploited", "bool", True, "Fast-track known-exploited (KEV) fixes"),
+            F("deferralDaysCritical", "int", 0, "Defer critical (days)", min=0, max=30),
+            F("deferralDaysOther", "int", 7, "Defer others (days)", min=0, max=90),
+            F("maintenanceWindow", "str", "daily 22:00-05:00", "Maintenance window"),
+            F("installInWindow", "bool", False, "Install approved patches automatically in the window",
+              help="Applies to devices no Patching-page policy covers. Off by default so upgrades never start patching unasked."),
+            F("rebootBehaviour", "enum", "prompt", "Reboots", options=("never", "prompt", "outside-hours", "force")),
+            F("vulnerabilityScanHours", "int", 24, "Vulnerability scan interval (hours)", min=1, max=168),
+        ),
+    ),
+    Section(
+        "tamper",
+        "Tamper protection",
+        "Stop users and malware from disabling protection.",
+        (
+            F("enabled", "bool", True, "Tamper protection"),
+            F("uninstallRequiresToken", "bool", True, "Uninstall needs a cloud token"),
+            F("protectServiceAndFiles", "bool", True, "Protect service, files and registry"),
+            F("selfDefenceSensitivity", "enum", "high", "Self-defence", options=("standard", "high")),
+        ),
+    ),
+    Section(
+        "response",
+        "Automated response",
+        "What the agent and cloud do without waiting for an analyst.",
+        (
+            F("autoIsolateOnCritical", "bool", False, "Isolate the device on critical incidents"),
+            F("autoKillOnHigh", "bool", True, "Kill malicious processes on high alerts"),
+            F("autoQuarantine", "bool", True, "Quarantine artefacts automatically"),
+            F("autoRollbackRansomware", "bool", True, "Roll back ransomware changes automatically"),
+            F("autoOpenTicket", "enum", "high", "Open a PSA ticket from", options=("off", "low", "medium", "high", "critical")),
+            F("remoteShell", "bool", False, "Allow remote shell for analysts",
+              help="SOC and customer analysts may open a remote terminal only when this is on. Technicians and admins follow 'Allow remote terminal'."),
+            F("scriptExecution", "bool", True, "Allow approved remote scripts"),
+        ),
+    ),
+    Section(
+        "remoteAccess",
+        "Remote access",
+        "Browser-based remote desktop, terminal and file transfer through the Fenrir relay.",
+        (
+            F("enabled", "bool", True, "Allow remote sessions"),
+            F("consent", "enum", "when_user_present", "Ask the user before connecting",
+              "Unattended devices (nobody signed in) never prompt.", options=("never", "when_user_present", "always")),
+            F("consentTimeoutSeconds", "int", 30, "Consent prompt timeout (seconds)", min=10, max=300),
+            F("onConsentTimeout", "enum", "deny", "If nobody answers", options=("deny", "allow")),
+            F("allowControl", "bool", True, "Technicians can control mouse and keyboard", "Off = view only."),
+            F("recordSessions", "bool", False, "Record remote sessions (screen and terminal output)",
+              help="Recordings are kept with device bundles for the retention period; only responders can play them back."),
+            F("allowTerminal", "bool", True, "Allow remote terminal (PowerShell / shell)"),
+            F("allowFileTransfer", "bool", True, "Allow file transfer"),
+            F("showBanner", "bool", True, "Show a 'session in progress' banner to the user"),
+            F("backstage", "enum", "off", "Backstage access",
+              "Silent SYSTEM/root terminal, files, processes and services with no prompt, banner or screen, even with nobody "
+              "signed in. Each session needs a fresh sign-in check and a reason, and is always recorded.", options=("off", "on")),
+            F("allowTunnels", "bool", False, "Allow tunnels through this device",
+              help="Technicians can reach agentless machines on this device's LAN (RDP, SSH, VNC, web UIs, Intel AMT) through it."),
+            F("tunnelPorts", "list", ["22", "23", "80", "443", "3389", "5900", "8080", "8443", "16992", "16993", "16994", "16995"], "Tunnel ports",
+              "TCP ports a tunnel may reach on private LAN addresses."),
+            F("blankScreen", "bool", False, "Allow technicians to blank the user's screen", platforms=("windows",)),
+            F("idleTimeoutMinutes", "int", 30, "End idle sessions after (minutes)", min=5, max=480),
+            F("maxFps", "int", 15, "Maximum frame rate", min=1, max=30),
+            F("defaultQuality", "int", 70, "Default image quality (%)", min=20, max=95),
+        ),
+    ),
+    Section(
+        "experience",
+        "End-user experience",
+        "What people at the device see and can do.",
+        (
+            F("trayIcon", "bool", True, "Show tray icon"),
+            F("notifications", "enum", "important", "Notifications", options=("none", "important", "all")),
+            F("allowUserScans", "bool", True, "Users can run scans"),
+            F("allowUserPause", "bool", False, "Users can pause protection"),
+            F("allowQuarantineRestore", "bool", False, "Users can restore from quarantine"),
+            F("brandName", "str", "Fenrir", "Brand name", "White-label the agent UI."),
+            F("supportContact", "str", "", "Support contact shown to users"),
+            F("language", "enum", "auto", "Language", options=("auto", "en", "de", "fr", "es", "it", "nl", "pl", "pt")),
+        ),
+    ),
+    Section(
+        "updates",
+        "Updates",
+        "Agent, engine and signature update rings.",
+        (
+            F("channel", "enum", "stable", "Release ring", options=("canary", "beta", "stable", "lts")),
+            F("autoUpdateAgent", "bool", True, "Update agent automatically"),
+            F("signatureIntervalMinutes", "int", 60, "Signature check interval (minutes)", min=5, max=1440),
+            F("peerCaching", "bool", True, "Share updates between devices on the LAN"),
+        ),
+    ),
+)
+
+# Settings an agent does not (yet) enforce on every platform it applies to: path -> platforms that DO
+# enforce it (empty = stored and shown, but no agent acts on it yet). Everything not listed is enforced
+# wherever it applies, by the agents or by the cloud itself. Keep in step with the agents.
+AGENT_SUPPORT: dict[str, tuple[str, ...]] = {
+    "antimalware.cloudLookupObserveOnly": ('windows',),
+    "antimalware.puaProtection": ('linux', 'macos'),
+    "antimalware.scanArchives": ('linux', 'macos'),
+    "antimalware.archiveObserveOnly": ('windows',),
+    "antimalware.archiveMaxDepth": ('linux', 'macos'),
+    "antimalware.scanMaliciousBlockThreshold": ('windows',),
+    "antimalware.scanMaliciousQuarantineThreshold": ('windows',),
+    "antimalware.scanBenignDampeningScore": ('windows',),
+    "antimalware.genericRuleScoreScalePercent": ('windows',),
+    "antimalware.realtimeExecuteBlockThreshold": ('windows',),
+    "antimalware.realtimeNonExecuteBlockThreshold": ('windows',),
+    "antimalware.realtimeQuarantineThreshold": ('windows',),
+    "antimalware.realtimeObserveTelemetryThreshold": ('windows',),
+    "antimalware.realtimeObserveOnlyForNonExecute": ('windows',),
+    "antimalware.enableCleanwareSignerDampening": ('windows',),
+    "antimalware.enableKnownGoodHashDampening": ('windows',),
+    "antimalware.exclusionSigners": ('windows',),
+    "antimalware.requireSignerForSuppression": ('windows',),
+    "antimalware.allowUnsignedSuppressionPathExecutables": ('windows',),
+    "edr.quarantineAfterProcessKill": ('windows',),
+    "edr.memoryScanning": (),
+    "edr.exploitProtection": (),
+    "edr.credentialProtection": ('windows',),
+    "edr.deceptionLures": (),
+    "edr.collectNetworkEvents": ('linux', 'macos'),
+    "edr.collectRegistryEvents": ('windows',),
+    "edr.telemetryUploadSeconds": ('linux', 'macos'),
+    "attackSurface.blockOfficeChildProcesses": ('windows',),
+    "attackSurface.blockOfficeExecutableContent": ('windows',),
+    "attackSurface.blockOfficeCodeInjection": ('windows',),
+    "attackSurface.blockScriptDownloadedPayloads": ('windows',),
+    "attackSurface.blockEmailExecutables": ('windows',),
+    "attackSurface.blockPsexecWmiProcessCreation": ('windows',),
+    "attackSurface.blockWmiPersistence": ('windows',),
+    "attackSurface.blockVulnerableSignedDrivers": ('windows',),
+    "attackSurface.blockAdobeReaderChildProcesses": ('windows',),
+    "attackSurface.advancedRansomwareProtection": ('windows',),
+    "ransomware.massEncryptionFilesPerMinute": ('windows',),
+    "ransomware.entropyDetection": ('windows',),
+    "ransomware.blockShadowCopyDeletion": ('windows',),
+    "ransomware.protectedFolders": ('windows',),
+    "ransomware.protectedFoldersMode": ('windows',),
+    "ransomware.allowedApps": ('windows',),
+    "ransomware.rollbackSnapshots": ('windows',),
+    "response.autoRollbackRansomware": ('windows',),
+    "ransomware.snapshotIntervalHours": ('windows',),
+    "ransomware.networkShareProtection": ('windows',),
+    "web.destinationProtectionEnabled": ('windows',),
+    "web.antiPhishingEnabled": ('windows',),
+    "web.webProtectionEnabled": ('windows',),
+    "web.emailLinkProtectionEnabled": ('windows',),
+    "web.evaluateDomains": ('windows',),
+    "web.evaluateUrls": ('windows',),
+    "web.blockKnownMaliciousDestinations": ('windows',),
+    "web.blockKnownPhishingDestinations": ('windows',),
+    "web.blockKnownScamDestinations": ('windows',),
+    "web.warnOnSuspiciousDestinations": ('windows',),
+    "web.warnOnNewlyRegisteredDomains": ('windows',),
+    "web.networkObserveOnly": ('windows',),
+    "web.allowDegradedDestinationModeWhenOffline": ('windows',),
+    "web.browserContextRequiredForWarnOnly": ('windows',),
+    "web.suspiciousDestinationWarnThreshold": ('windows',),
+    "web.phishingWarnThreshold": ('windows',),
+    "web.phishingBlockThreshold": ('windows',),
+    "web.destinationCacheTtlMinutes": ('windows',),
+    "web.bankingProtection": (),
+    "dns.localProxy": ('linux', 'macos'),
+    "dns.localProxyFailMode": ('linux', 'macos'),
+    "dns.sinkholeInterception": ('linux', 'macos'),
+    "dns.localCacheMinutes": ('linux', 'macos'),
+    "firewall.networkAttackProtection": (),
+    "firewall.bruteForceProtection": ('windows', 'linux', 'macos'),
+    "firewall.blockSmbV1": ('windows',),
+    "firewall.blockLlmnrNetbios": ('windows',),
+    "firewall.isolationAllowlist": ('linux', 'macos'),
+    "applicationControl.allowedPublishers": ('windows',),
+    "applicationControl.blockNewlySeenExecutables": (),
+    "privilege.removeLocalAdmins": ('windows',),
+    "privilege.elevationRequests": ('windows',),
+    "privilege.elevationMinutes": ('windows',),
+    "privilege.autoApprovePublishers": (),
+    "tamper.enabled": ('windows',),
+    "tamper.uninstallRequiresToken": ('windows',),
+    "tamper.protectServiceAndFiles": ('windows',),
+    "tamper.selfDefenceSensitivity": (),
+    "experience.trayIcon": ('windows',),
+    "experience.notifications": ('windows',),
+    "experience.allowUserScans": ('windows',),
+    "experience.allowUserPause": ('windows',),
+    "experience.allowQuarantineRestore": ('windows',),
+    "experience.brandName": ('windows',),
+    "experience.supportContact": ('windows',),
+    "updates.signatureIntervalMinutes": ('linux', 'macos'),
+    "updates.peerCaching": (),
+}
+
+
+def enforced_on(path: str, spec: "F") -> list[str]:
+    return list(AGENT_SUPPORT.get(path, spec.platforms))
+
+
+SECTIONS = {section.key: section for section in SCHEMA}
+FIELDS = {f"{section.key}.{f.key}": f for section in SCHEMA for f in section.fields}
+
+
+def defaults() -> dict:
+    return {section.key: {f.key: copy.deepcopy(f.default) for f in section.fields} for section in SCHEMA}
+
+
+# ---------------------------------------------------------------------------
+# Templates: starting points that only list what differs from defaults.
+# ---------------------------------------------------------------------------
+
+TEMPLATES: dict[str, dict[str, Any]] = {
+    "balanced": {
+        "_label": "Balanced (recommended)",
+        "_description": "Strong protection with low friction. Right for most businesses.",
+    },
+    "home": {
+        "_label": "Home and family",
+        "_description": "Consumer-friendly: adult/gambling DNS blocking, simple notifications.",
+        "dns": {"blockedCategories": ["malware", "phishing", "command-and-control", "cryptomining", "dga", "adult", "gambling"],
+                "safeSearch": True},
+        "experience": {"allowUserPause": True, "allowQuarantineRestore": True},
+        "patch": {"rebootBehaviour": "prompt"},
+    },
+    "strict": {
+        "_label": "Strict / high security",
+        "_description": "Regulated industries. Aggressive ML, USB read-only, privilege management on.",
+        "antimalware": {"mlSensitivity": "aggressive", "scanNetworkDrives": True, "realtimeExecuteBlockThreshold": 50},
+        "edr": {"telemetryLevel": "verbose", "deceptionLures": True},
+        "attackSurface": {key: "block" for key, _ in ASR_RULES},
+        "ransomware": {"mode": "block-and-rollback", "protectedFoldersMode": "block"},
+        "dns": {"blockedCategories": ["malware", "phishing", "command-and-control", "cryptomining", "dga", "newly-registered",
+                                      "parked", "proxies-vpn", "doh-bypass", "piracy"]},
+        "deviceControl": {"usbStorage": "read-only", "encryptedUsbOnly": True, "bluetoothFileTransfer": "block"},
+        "applicationControl": {"mode": "enforce-denylist", "blockUnknownReputation": True},
+        "privilege": {"enabled": True, "removeLocalAdmins": True},
+        "response": {"autoIsolateOnCritical": True, "autoOpenTicket": "medium"},
+        "web": {"blockKnownScamDestinations": True},
+    },
+    "lockdown": {
+        "_label": "Lockdown / kiosk",
+        "_description": "Allow-list only. For kiosks, POS terminals and single-purpose machines.",
+        "applicationControl": {"mode": "enforce-allowlist", "blockUnknownReputation": True, "blockNewlySeenExecutables": True},
+        "deviceControl": {"usbStorage": "block", "bluetoothFileTransfer": "block", "opticalMedia": "block", "mtpDevices": "block"},
+        "firewall": {"defaultOutbound": "block"},
+        "experience": {"trayIcon": False, "notifications": "none", "allowUserScans": False},
+        "privilege": {"enabled": True, "removeLocalAdmins": True, "elevationRequests": "off"},
+    },
+    "server": {
+        "_label": "Server",
+        "_description": "Tuned for servers: low CPU scans, webshell blocking, no user prompts.",
+        "antimalware": {"scanCpuLimitPercent": 25, "quickScanSchedule": "daily 03:00", "scanRemovableMedia": False},
+        "attackSurface": {"blockWebshellCreation": "block", "blockPsexecWmiProcessCreation": "audit"},
+        "experience": {"trayIcon": False, "notifications": "none"},
+        "patch": {"rebootBehaviour": "never", "autoApprove": "critical"},
+        "ransomware": {"networkShareProtection": True, "snapshotIntervalHours": 2},
+    },
+    "developer": {
+        "_label": "Developer workstation",
+        "_description": "Fewer false positives for build tools and scripting.",
+        "antimalware": {"mlSensitivity": "cautious", "exclusionProcesses": ["node.exe", "dotnet.exe", "cargo.exe", "go.exe", "python.exe"]},
+        "attackSurface": {"blockObfuscatedScripts": "audit", "blockLolbinAbuse": "audit"},
+    },
+    "audit": {
+        "_label": "Audit only (evaluation)",
+        "_description": "Detect and report everything, block nothing. Use for proof-of-value or migrations.",
+        "antimalware": {"quarantineOnMalicious": False, "cloudLookupObserveOnly": True, "archiveObserveOnly": True,
+                        "realtimeObserveOnlyForNonExecute": True, "puaProtection": "audit"},
+        "edr": {"enforceProcessStartVerdicts": False, "terminateProcessTreeOnExecuteBlock": False, "quarantineAfterProcessKill": False},
+        "attackSurface": {key: "audit" for key, _ in ASR_RULES},
+        "ransomware": {"mode": "audit", "protectedFoldersMode": "audit"},
+        "web": {"networkObserveOnly": True},
+        "dns": {"mode": "observe"},
+        "response": {"autoKillOnHigh": False, "autoQuarantine": False, "autoRollbackRansomware": False},
+    },
+}
+
+
+def template_settings(name: str) -> dict:
+    template = TEMPLATES.get(name, TEMPLATES["balanced"])
+    return {key: value for key, value in template.items() if not key.startswith("_")}
+
+
+# ---------------------------------------------------------------------------
+# Validation and merging
+# ---------------------------------------------------------------------------
+
+
+class PolicyError(ValueError):
+    pass
+
+
+def _coerce(path: str, spec: F, value: Any) -> Any:
+    if spec.kind == "bool":
+        if not isinstance(value, bool):
+            raise PolicyError(f"{path} must be true or false")
+        return value
+    if spec.kind == "int":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise PolicyError(f"{path} must be a number")
+        value = int(value)
+        if spec.min is not None and value < spec.min or spec.max is not None and value > spec.max:
+            raise PolicyError(f"{path} must be between {spec.min} and {spec.max}")
+        return value
+    if spec.kind == "enum":
+        if value not in spec.options:
+            raise PolicyError(f"{path} must be one of {', '.join(spec.options)}")
+        return value
+    if spec.kind == "list":
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise PolicyError(f"{path} must be a list of strings")
+        cleaned = [item.strip() for item in value if item.strip()]
+        if spec.options:
+            bad = [item for item in cleaned if item not in spec.options]
+            if bad:
+                raise PolicyError(f"{path} has unknown values: {', '.join(bad)}")
+        if path == "firewall.rules":
+            for item in cleaned:
+                if not item.startswith("#") and parse_firewall_rule(item) is None:
+                    raise PolicyError(
+                        f"firewall.rules: cannot read '{item}'. Use lines like 'allow in tcp 3389 from 10.0.0.0/8', "
+                        "'block out udp any to 203.0.113.0/24' or 'allow in tcp 80,443'."
+                    )
+        return cleaned
+    if spec.kind == "str":
+        if not isinstance(value, str):
+            raise PolicyError(f"{path} must be text")
+        if spec.key in {"quickScanSchedule", "fullScanSchedule"} and parse_scan_schedule(value) is None:
+            raise PolicyError(f"{path}: use a schedule like 'daily 12:30', 'weekdays 09:00', 'weekly sun 02:00' or 'off'")
+        return value[:500]
+    raise PolicyError(f"{path} has unsupported type")  # pragma: no cover
+
+
+def validate_partial(settings: dict) -> dict:
+    """Validate a sparse layer and return a cleaned copy. Unknown keys are rejected."""
+    if not isinstance(settings, dict):
+        raise PolicyError("settings must be an object")
+    cleaned: dict = {}
+    for section_key, values in settings.items():
+        section = SECTIONS.get(section_key)
+        if section is None:
+            raise PolicyError(f"unknown section '{section_key}'")
+        if not isinstance(values, dict):
+            raise PolicyError(f"{section_key} must be an object")
+        for key, value in values.items():
+            path = f"{section_key}.{key}"
+            spec = FIELDS.get(path)
+            if spec is None:
+                raise PolicyError(f"unknown setting '{path}'")
+            cleaned.setdefault(section_key, {})[key] = _coerce(path, spec, value)
+    return cleaned
+
+
+def validate_locks(locks: list) -> list[str]:
+    if not isinstance(locks, list):
+        raise PolicyError("locks must be a list")
+    bad = [lock for lock in locks if lock not in FIELDS and lock not in SECTIONS]
+    if bad:
+        raise PolicyError(f"unknown lock keys: {', '.join(bad)}")
+    return sorted(set(locks))
+
+
+def _is_locked(path: str, locked: set[str]) -> bool:
+    return path in locked or path.split(".", 1)[0] in locked
+
+
+@dataclass
+class Layer:
+    name: str
+    settings: dict
+    locks: list[str] = field(default_factory=list)
+
+
+def resolve(layers: list[Layer]) -> dict:
+    """Merge layers (most general first). Returns settings plus provenance.
+
+    ``origin`` tells the console which layer set each value, and ``locked``
+    which layer locked it, so admins can see why a device behaves as it does.
+    """
+    effective = defaults()
+    origin = {path: "default" for path in FIELDS}
+    locked_by: dict[str, str] = {}
+    blocked: list[dict] = []
+
+    for layer in layers:
+        for section_key, values in layer.settings.items():
+            for key, value in values.items():
+                path = f"{section_key}.{key}"
+                if path not in FIELDS:
+                    continue
+                if _is_locked(path, set(locked_by)):
+                    blocked.append({"setting": path, "layer": layer.name, "lockedBy": locked_by.get(path) or locked_by.get(section_key)})
+                    continue
+                effective[section_key][key] = copy.deepcopy(value)
+                origin[path] = layer.name
+        for lock in layer.locks:
+            locked_by.setdefault(lock, layer.name)
+
+    return {"settings": effective, "origin": origin, "locked": locked_by, "overridesBlocked": blocked}
+
+
+def revision(settings: dict) -> str:
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Agent translation
+# ---------------------------------------------------------------------------
+
+
+_DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_DAY_GROUPS = {"daily": list(range(7)), "weekdays": [0, 1, 2, 3, 4], "weekends": [5, 6]}
+
+
+def parse_scan_schedule(text: str) -> dict | None:
+    """'daily 12:30', 'weekdays 09:00', 'weekly sun 02:00', 'sat,sun 03:00', 'mon-fri 20:00', 'off'.
+
+    Returns {"off": bool, "days": [0=Mon..6], "minuteOfDay": int} in the device's local time, or None
+    when the text cannot be read (agents then keep their built-in interval).
+    """
+    text = (text or "").strip().lower()
+    if text in {"off", "never", "disabled", "none"}:
+        return {"off": True, "days": [], "minuteOfDay": 0}
+    match = re.fullmatch(r"(?:weekly\s+)?([a-z,\-]+)\s+(\d{1,2}):(\d{2})", text)
+    if not match or int(match.group(2)) > 23 or int(match.group(3)) > 59:
+        return None
+    days: list[int] = []
+    for part in match.group(1).split(","):
+        if part in _DAY_GROUPS:
+            days += _DAY_GROUPS[part]
+        elif "-" in part and all(p in _DAYS for p in part.split("-", 1)):
+            start, end = (_DAYS[p] for p in part.split("-", 1))
+            days += [d % 7 for d in range(start, start + ((end - start) % 7) + 1)]
+        elif part in _DAYS:
+            days.append(_DAYS[part])
+        else:
+            return None
+    return {"off": False, "days": sorted(set(days)), "minuteOfDay": int(match.group(2)) * 60 + int(match.group(3))}
+
+
+def parse_firewall_rule(text: str) -> dict | None:
+    """Parse one custom firewall rule line.
+
+    Grammar: ``<allow|block> <in|out> <tcp|udp|any> [ports] [from|to <addresses>]``.
+    Ports are ``any``, ``N``, ``N-M`` or a comma list of those (tcp/udp only). Addresses are ``any`` or a comma
+    list of IPv4/IPv6 addresses or CIDR ranges; they are always the remote end. Returns None when unreadable.
+    """
+    words = text.strip().lower().split()
+    if len(words) < 3 or words[0] not in {"allow", "block"} or words[1] not in {"in", "out"} or words[2] not in {"tcp", "udp", "any"}:
+        return None
+    rule: dict = {"action": words[0], "direction": words[1], "protocol": words[2], "ports": [], "remote": []}
+    rest = words[3:]
+    if rest and rest[0] not in {"from", "to"}:
+        ports = rest.pop(0)
+        if ports != "any":
+            if rule["protocol"] == "any":
+                return None
+            for part in ports.split(","):
+                low, _, high = part.partition("-")
+                if not low.isdigit() or (high and not high.isdigit()):
+                    return None
+                lo, hi = int(low), int(high or low)
+                if not 1 <= lo <= hi <= 65535:
+                    return None
+                rule["ports"].append([lo, hi])
+            if len(rule["ports"]) > 32:
+                return None
+    if rest:
+        if len(rest) != 2 or rest[0] not in {"from", "to"}:
+            return None
+        if rest[1] != "any":
+            for part in rest[1].split(","):
+                try:
+                    network = ipaddress.ip_network(part, strict=False)
+                except ValueError:
+                    return None
+                rule["remote"].append(str(network) if "/" in part else str(network.network_address))
+            if len(rule["remote"]) > 64:
+                return None
+    return rule
+
+
+# Public resolvers that browsers and malware use to bypass the device's DNS (and Fenrir's DNS filtering).
+THIRD_PARTY_DOH_RESOLVERS = (
+    "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",      # Cloudflare
+    "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844",      # Google
+    "9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",                 # Quad9
+    "208.67.222.222", "208.67.220.220", "2620:119:35::35", "2620:119:53::53",  # OpenDNS
+    "94.140.14.14", "94.140.15.15",                                            # AdGuard
+    "45.90.28.0/24", "45.90.30.0/24",                                          # NextDNS
+)
+MAX_BOTNET_IPS = 1000
+_LOCAL_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+    "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"))
+
+
+def managed_firewall_rules(settings: dict, botnet_ips: list[str] | None = None) -> list[dict]:
+    """Block rules Fenrir adds to the custom rules: third-party encrypted DNS and known C2 addresses."""
+    rules: list[dict] = []
+    if settings.get("dns", {}).get("blockThirdPartyDoh"):
+        resolvers = list(THIRD_PARTY_DOH_RESOLVERS)
+        rules.append({"action": "block", "direction": "out", "protocol": "tcp", "ports": [[443, 443]], "remote": resolvers})
+        rules.append({"action": "block", "direction": "out", "protocol": "udp", "ports": [[443, 443]], "remote": resolvers})
+        rules.append({"action": "block", "direction": "out", "protocol": "tcp", "ports": [[853, 853]], "remote": []})  # DNS over TLS
+        rules.append({"action": "block", "direction": "out", "protocol": "udp", "ports": [[853, 853]], "remote": []})
+    ips = []
+    for value in (botnet_ips or [])[:MAX_BOTNET_IPS] if settings.get("firewall", {}).get("botnetProtection") else []:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            continue
+        if any(network.version == local.version and network.overlaps(local) for local in _LOCAL_NETWORKS) or network.prefixlen < 8:
+            continue  # a bad feed entry must never cut a device off its own network (or a huge range)
+        ips.append(str(network) if "/" in value else str(network.network_address))
+    # One rule per direction and address family keeps each firewall rule a manageable size.
+    for start in range(0, len(ips), 200):
+        chunk = ips[start:start + 200]
+        rules.append({"action": "block", "direction": "out", "protocol": "any", "ports": [], "remote": chunk})
+        rules.append({"action": "block", "direction": "in", "protocol": "any", "ports": [], "remote": chunk})
+    return rules
+
+
+def to_agent_policy(policy_id: str, name: str, settings: dict, botnet_ips: list[str] | None = None,
+                    trusted_sha256: list[str] | None = None, edr_exclusions: list[dict] | None = None) -> dict:
+    """Translate effective settings into the document agents parse.
+
+    The top-level keys are exactly what the Windows service's
+    ``ParsePolicySnapshot`` reads. Newer modules ride along under ``modules``
+    so older agents ignore them safely and newer agents can opt in.
+    """
+    am, edr, web, fw = settings["antimalware"], settings["edr"], settings["web"], settings["firewall"]
+    doc = {
+        "id": policy_id,
+        "name": name,
+        "revision": revision(settings),
+        "realtimeProtection": am["realtimeProtection"],
+        "cloudLookup": am["cloudLookup"],
+        "scriptInspection": am["scriptInspection"],
+        "networkContainment": fw["networkContainment"],
+        "quarantineOnMalicious": am["quarantineOnMalicious"],
+        "suppressionPathRoots": am["exclusionPaths"],
+        # Policy exclusions plus files analysts marked as false positives (allow indicators).
+        "suppressionSha256": sorted({value.lower() for value in [*am["exclusionSha256"], *(trusted_sha256 or [])]}),
+        "suppressionSignerNames": am["exclusionSigners"],
+    }
+    for key in (
+        "scanMaliciousBlockThreshold", "scanMaliciousQuarantineThreshold", "scanBenignDampeningScore",
+        "genericRuleScoreScalePercent", "realtimeExecuteBlockThreshold", "realtimeNonExecuteBlockThreshold",
+        "realtimeQuarantineThreshold", "realtimeObserveTelemetryThreshold", "realtimeObserveOnlyForNonExecute",
+        "archiveObserveOnly", "cloudLookupObserveOnly", "requireSignerForSuppression",
+        "allowUnsignedSuppressionPathExecutables", "enableCleanwareSignerDampening", "enableKnownGoodHashDampening",
+    ):
+        doc[key] = am[key]
+    for key in (
+        "terminateProcessTreeOnExecuteBlock", "enforceProcessStartVerdicts", "quarantineAfterProcessKill",
+        "failServiceStartupIfRealtimeCoverageMissing", "requireMinifilterBrokerConnection",
+    ):
+        doc[key] = edr[key]
+    for key, value in web.items():
+        if key != "bankingProtection":
+            doc[key] = value
+    # Agents enforce the quarantine threshold as >= block threshold; keep them consistent.
+    doc["scanMaliciousQuarantineThreshold"] = max(doc["scanMaliciousQuarantineThreshold"], doc["scanMaliciousBlockThreshold"])
+    doc["realtimeQuarantineThreshold"] = max(
+        doc["realtimeQuarantineThreshold"], doc["realtimeExecuteBlockThreshold"], doc["realtimeNonExecuteBlockThreshold"]
+    )
+    doc["modules"] = {
+        key: value for key, value in settings.items() if key not in {"antimalware", "web"}
+    }
+    doc["modules"]["antimalware"] = {
+        key: am[key] for key in ("mlSensitivity", "puaProtection", "scanArchives", "archiveMaxDepth", "scanRemovableMedia",
+                                 "scanNetworkDrives", "quickScanSchedule", "fullScanSchedule", "scanCpuLimitPercent",
+                                 "exclusionProcesses")
+    }
+    doc["modules"]["firewall"] = dict(fw)
+    managed = managed_firewall_rules(settings, botnet_ips)
+    doc["modules"]["firewall"]["parsedRules"] = [
+        rule for rule in (parse_firewall_rule(line) for line in fw.get("rules", []) if not line.startswith("#")) if rule
+    ] + managed
+    if botnet_ips and settings.get("firewall", {}).get("botnetProtection"):
+        # The block list changes without the settings changing: fold it into the revision so agents refresh.
+        doc["revision"] = hashlib.sha256((doc["revision"] + "|" + ",".join(botnet_ips)).encode()).hexdigest()[:16]
+    if trusted_sha256:
+        doc["revision"] = hashlib.sha256((doc["revision"] + "|trusted|" + ",".join(sorted(trusted_sha256))).encode()).hexdigest()[:16]
+    if edr_exclusions:
+        # Strict process-chain/hash exclusions (edr_exclusions.py); they change without the settings changing.
+        # An object, not a bare list: the Go agent decodes every module as a JSON object.
+        doc["modules"]["edrExclusions"] = {"rules": edr_exclusions}
+        doc["revision"] = hashlib.sha256((doc["revision"] + "|exclusions|" + json.dumps(edr_exclusions, sort_keys=True))
+                                         .encode()).hexdigest()[:16]
+    for key, plan_key in (("quickScanSchedule", "quickScanPlan"), ("fullScanSchedule", "fullScanPlan")):
+        plan = parse_scan_schedule(str(am.get(key) or ""))
+        if plan is not None:
+            doc["modules"]["antimalware"][plan_key] = plan
+    return doc
+
+
+def schema_document() -> dict:
+    """The schema as JSON for the console's generated policy editor."""
+    return {
+        "sections": [
+            {
+                "key": section.key,
+                "title": section.title,
+                "description": section.description,
+                "fields": [
+                    {
+                        "key": f.key,
+                        "path": f"{section.key}.{f.key}",
+                        "kind": f.kind,
+                        "default": f.default,
+                        "label": f.label,
+                        "help": f.help,
+                        "min": f.min,
+                        "max": f.max,
+                        "options": list(f.options),
+                        "platforms": list(f.platforms),
+                        "enforcedOn": enforced_on(f"{section.key}.{f.key}", f),
+                    }
+                    for f in section.fields
+                ],
+            }
+            for section in SCHEMA
+        ],
+        "templates": [
+            {"key": key, "label": value["_label"], "description": value["_description"]} for key, value in TEMPLATES.items()
+        ],
+        "fieldCount": len(FIELDS),
+    }
